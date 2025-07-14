@@ -1,0 +1,24 @@
+# --- Configuration Files ---
+# Ignore files containing secrets and personal data
+keys.json
+persona.txt
+chat_history.json
+
+# --- Python ---
+# Ignore virtual environment folders
+/venv/
+/.venv/
+/env/
+/.env/
+
+# Ignore Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- IDE / Editor specific files ---
+# Visual Studio Code
+.vscode/
+
+# Jetbrains
+.idea/
