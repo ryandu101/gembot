@@ -18,9 +18,11 @@ KEYS_FILE = "keys.json"
 PERSONA_FILE = "persona.txt"
 USER_NOTES_FILE = "user_notes.json"
 META_PERSONA_FILE = "meta_persona.txt"
-# ✅ Re-introduced the chat history file for permanent logging
 CHAT_HISTORY_FILE = "chat_history.json"
 DEV_GUILD_ID = 123456789012345678 # Replace with your actual Server ID
+# Set the short-term memory window (in conversation turns)
+SHORT_TERM_MEMORY_TURNS = 5 
+
 
 def load_keys(filepath):
     """Loads Discord and Gemini keys from the keys.json file."""
@@ -52,7 +54,7 @@ META_PERSONA = load_text_file(META_PERSONA_FILE)
 
 
 # --- State Management for API Keys ---
-current_api_key_index = 0
+current_api_key_index = 6
 
 # --- Safety Settings Configuration ---
 safety_settings = {
@@ -125,8 +127,7 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     except Exception as e:
         print(f"An error occurred during note update for user {user_id}: {e}")
 
-# ✅ NEW: Function to log raw conversations for archival
-def log_to_chat_history(channel_id, user_prompt_parts, bot_response_text):
+def log_to_chat_history(channel_id, user_prompt_parts, bot_response_text, message_id=None):
     """Logs the raw user prompt and bot response to the chat_history.json file."""
     try:
         with open(CHAT_HISTORY_FILE, 'r') as f:
@@ -138,11 +139,13 @@ def log_to_chat_history(channel_id, user_prompt_parts, bot_response_text):
     if channel_id_str not in all_histories:
         all_histories[channel_id_str] = []
 
-    # Format user prompt for logging (text parts only)
     user_log_parts = [part for part in user_prompt_parts if isinstance(part, str)]
     
-    # Append the user message and bot response
-    all_histories[channel_id_str].append({'role': 'user', 'parts': user_log_parts})
+    user_entry = {'role': 'user', 'parts': user_log_parts}
+    if message_id:
+        user_entry['id'] = message_id
+
+    all_histories[channel_id_str].append(user_entry)
     all_histories[channel_id_str].append({'role': 'model', 'parts': [bot_response_text]})
 
     with open(CHAT_HISTORY_FILE, 'w') as f:
@@ -160,6 +163,36 @@ def rotate_api_key():
     print(f"Switching to API Key index {current_api_key_index}")
     model = create_model()
 
+# --- Unified Context Building Function ---
+def build_context_prompt(user_id, channel_id):
+    """Builds the prompt context using long-term notes and short-term history."""
+    user_notes = load_user_notes(user_id)
+    
+    try:
+        with open(CHAT_HISTORY_FILE, 'r') as f:
+            all_histories = json.load(f)
+        
+        channel_history = all_histories.get(str(channel_id), [])
+        recent_history = channel_history[-(SHORT_TERM_MEMORY_TURNS * 2):]
+        
+        history_lines = []
+        for entry in recent_history:
+            role = "Gem" if entry['role'] == 'model' else "User"
+            content = " ".join(entry['parts'])
+            history_lines.append(f"{role}: {content}")
+        
+        short_term_memory = "\n".join(history_lines)
+
+    except (FileNotFoundError, json.JSONDecodeError):
+        short_term_memory = "No chat history found."
+
+    context_parts = [
+        f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
+        f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
+    ]
+    
+    return context_parts
+
 @bot.event
 async def on_ready():
     try:
@@ -171,10 +204,8 @@ async def on_ready():
         else:
             await bot.tree.sync()
             print("Synced commands globally.")
-            
     except Exception as e:
         print(e)
-        
     print(f'Logged in as {bot.user}')
     print(f'Using API Key index {current_api_key_index}')
     print('------')
@@ -185,11 +216,13 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
     user_id = interaction.user.id
     channel_id = interaction.channel.id
     
-    user_notes = load_user_notes(user_id)
-    final_prompt_parts = [f"Here are my notes on this user: {user_notes}\n\n"]
+    final_prompt_parts = build_context_prompt(user_id, channel_id)
+    
+    log_message = f"<@{user_id}> used /gemini"
 
     if prompt:
-        final_prompt_parts.append(f"<@{user_id}> said: {prompt}")
+        final_prompt_parts.append(f"\n<@{user_id}> said: {prompt}")
+        log_message += f" with prompt: '{prompt}'"
     
     if attachment:
         if "image" in attachment.content_type:
@@ -197,6 +230,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
                 image_bytes = await attachment.read()
                 img = Image.open(io.BytesIO(image_bytes))
                 final_prompt_parts.append(img)
+                log_message += " and an image attachment."
                 if not prompt:
                      final_prompt_parts.append(f"\n<@{user_id}> sent an image. Please describe or react to it.")
             except Exception as e:
@@ -206,11 +240,11 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             await interaction.followup.send(content="Sorry, I can only process image files right now.", ephemeral=True)
             return
 
-    if len(final_prompt_parts) <= 1 and not attachment:
-        await interaction.followup.send(content="Please provide a prompt or an image.", ephemeral=True)
-        return
+    if not prompt and not attachment:
+        final_prompt_parts.append(f"\n<@{user_id}> has continued the conversation without adding a new message. Please respond based on the context.")
+        log_message += " to continue the conversation."
     
-    print(f"Slash command prompt parts: {final_prompt_parts}")
+    print(log_message)
 
     try:
         response = await model.generate_content_async(final_prompt_parts)
@@ -221,9 +255,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
         else:
             bot_response_text = response.text
             await interaction.followup.send(content=bot_response_text)
-            # Log the raw interaction
-            log_to_chat_history(channel_id, final_prompt_parts, bot_response_text)
-            # Update the user's notes
+            log_to_chat_history(channel_id, [log_message], bot_response_text)
             user_prompt_text = prompt or "Sent an image"
             summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
             await update_notes_with_gemini(user_id, summary)
@@ -262,24 +294,33 @@ async def on_message(message):
         user_id = message.author.id
         channel_id = message.channel.id
         
-        user_notes = load_user_notes(user_id)
-        prompt_parts = [f"Here are my notes on this user: {user_notes}\n\n"]
+        prompt_parts = build_context_prompt(user_id, channel_id)
+        
+        log_message = f"<@{user_id}> said: '{message.content}'"
         
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_message = message.reference.resolved
-            prompt_parts.append(f"<@{original_message.author.id}> said: '{original_message.content}'\n\n"
-                                f"<@{user_id}> replied: '{message.content}'")
+            prompt_parts.append(f"\n<@{original_message.author.id}> said: '{original_message.content}'")
+            for attachment in original_message.attachments:
+                if "image" in attachment.content_type:
+                    try:
+                        image_bytes = await attachment.read()
+                        prompt_parts.append(Image.open(io.BytesIO(image_bytes)))
+                        log_message += " (replying to an image)"
+                    except Exception as e:
+                        print(f"Could not process replied image: {e}")
+            prompt_parts.append(f"\n\n<@{user_id}> replied: '{message.content}'")
         else:
-            prompt_parts.append(f"<@{user_id}> said: {message.content}")
+            prompt_parts.append(f"\n<@{user_id}> said: {message.content}")
 
         for attachment in message.attachments:
             if "image" in attachment.content_type:
                 try:
                     image_bytes = await attachment.read()
-                    img = Image.open(io.BytesIO(image_bytes))
-                    prompt_parts.append(img)
+                    prompt_parts.append(Image.open(io.BytesIO(image_bytes)))
+                    log_message += " (with an image attachment)"
                 except Exception as e:
-                    print(f"Could not process image attachment: {e}")
+                    print(f"Could not process new image: {e}")
             else:
                 prompt_parts.append(f"\n(User also attached a file named '{attachment.filename}' that cannot be viewed.)")
         
@@ -287,7 +328,7 @@ async def on_message(message):
              print("Ignoring message with no text or valid images.")
              return
 
-        print(f"Message prompt parts: {prompt_parts}")
+        print(log_message)
 
         try:
             async with message.channel.typing():
@@ -299,9 +340,7 @@ async def on_message(message):
                 else:
                     bot_response_text = response.text
                     await message.reply(bot_response_text)
-                    # Log the raw interaction
-                    log_to_chat_history(channel_id, prompt_parts, bot_response_text)
-                    # Update the user's notes
+                    log_to_chat_history(channel_id, [log_message], bot_response_text, message.id)
                     summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
                     await update_notes_with_gemini(user_id, summary)
 
@@ -371,7 +410,59 @@ async def initialize_notes(interaction: discord.Interaction):
         except Exception as e:
             print(f"An error occurred while generating notes for user {user_id}: {e}")
             
-    # ✅ Removed the "temporary" wording from the confirmation message
     await interaction.followup.send(f"Initialization complete! Created or updated notes for {initialized_users} user(s).")
+
+@bot.tree.command(name="condense_all_notes", description="[Owner Only] Condenses all user notes to reduce size.")
+@commands.is_owner()
+async def condense_all_notes(interaction: discord.Interaction):
+    """
+    Loads all user notes, asks the meta_persona to condense each one, and saves the results.
+    """
+    await interaction.response.defer(ephemeral=True)
+    print("Starting manual note condensation for all users...")
+
+    try:
+        with open(USER_NOTES_FILE, 'r') as f:
+            all_notes = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        await interaction.followup.send("Could not find or read the user_notes.json file.")
+        return
+
+    if not all_notes:
+        await interaction.followup.send("There are no user notes to condense.")
+        return
+
+    meta_model = create_model(persona=META_PERSONA)
+    condensed_count = 0
+    error_count = 0
+
+    for user_id, existing_notes in all_notes.items():
+        print(f"Condensing notes for user {user_id}...")
+        condensation_prompt = (
+            f"The following notes for user <@{user_id}> may be too long. "
+            "Your task is to aggressively summarize and condense them. Retain the most critical information about their personality, "
+            "interests, and key facts, but significantly reduce the overall length. Rewrite the notes to be as efficient as possible.\n\n"
+            f"**Existing Notes to Condense:**\n{existing_notes}"
+        )
+
+        try:
+            response = await meta_model.generate_content_async(condensation_prompt)
+            if response.text:
+                new_notes = response.text
+                all_notes[user_id] = new_notes
+                print(f"Successfully condensed notes for user {user_id}.")
+                condensed_count += 1
+            else:
+                print(f"Meta-model failed to condense notes for user {user_id}.")
+                error_count += 1
+        except Exception as e:
+            print(f"An error occurred during note condensation for user {user_id}: {e}")
+            error_count += 1
+    
+    with open(USER_NOTES_FILE, 'w') as f:
+        json.dump(all_notes, f, indent=4)
+
+    await interaction.followup.send(f"Condensation complete! Successfully processed notes for {condensed_count} user(s). Failed to process {error_count} user(s).")
+
 
 bot.run(DISCORD_TOKEN)
