@@ -249,9 +249,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
     try:
         response = await model.generate_content_async(final_prompt_parts)
         if not response.parts:
-            print("API response was empty. Rotating key.")
-            rotate_api_key()
-            await interaction.followup.send(content="There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
+            await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
         else:
             bot_response_text = response.text
             await interaction.followup.send(content=bot_response_text)
@@ -260,14 +258,17 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
             await update_notes_with_gemini(user_id, summary)
             
+    # --- ✅ NEW: Refined Error Handling ---
+    except api_core_exceptions.ResourceExhausted as e:
+        print(f"Quota exceeded: {e}. Rotating key.")
+        rotate_api_key()
+        await interaction.followup.send(content=f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
     except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
-        print(f"API Error: {e}. Rotating key.")
-        rotate_api_key()
-        await interaction.followup.send(content="There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
+        print(f"Prompt-related API Error: {e}")
+        await interaction.followup.send(content=f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
     except Exception as e:
-        print(f"An unexpected API error occurred: {e}. Rotating key.")
-        rotate_api_key()
-        await interaction.followup.send(content="An unexpected API error occurred. I've switched to a backup key, please try again.")
+        print(f"An unexpected error occurred: {e}")
+        await interaction.followup.send(content=f"An unexpected error occurred: `{e}`")
 
 @bot.event
 async def on_message(message):
@@ -334,9 +335,7 @@ async def on_message(message):
             async with message.channel.typing():
                 response = await model.generate_content_async(prompt_parts)
                 if not response.parts:
-                    print("API response was empty. Rotating key.")
-                    rotate_api_key()
-                    await message.reply("There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
+                    await message.reply("My response was blocked or empty. This might be due to the prompt or safety filters.")
                 else:
                     bot_response_text = response.text
                     await message.reply(bot_response_text)
@@ -344,14 +343,17 @@ async def on_message(message):
                     summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
                     await update_notes_with_gemini(user_id, summary)
 
+        # --- ✅ NEW: Refined Error Handling ---
+        except api_core_exceptions.ResourceExhausted as e:
+            print(f"Quota exceeded: {e}. Rotating key.")
+            rotate_api_key()
+            await message.reply(f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
         except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
-            print(f"API Error: {e}. Rotating key.")
-            rotate_api_key()
-            await message.reply("There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
+            print(f"Prompt-related API Error: {e}")
+            await message.reply(f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
         except Exception as e:
-            print(f"An unexpected API error occurred: {e}. Rotating key.")
-            rotate_api_key()
-            await message.reply("An unexpected API error occurred. I've switched to a backup key, please try again.")
+            print(f"An unexpected error occurred: {e}")
+            await message.reply(f"An unexpected error occurred: `{e}`")
 
 @bot.tree.command(name="initialize_notes", description="[Owner Only] Creates initial user notes from chat history.")
 @commands.is_owner()
