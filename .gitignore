@@ -3,6 +3,8 @@
 keys.json
 persona.txt
 chat_history.json
+meta_persona.txt
+user_notes.json
 
 # --- Python ---
 # Ignore virtual environment folders

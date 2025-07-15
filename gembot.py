@@ -6,16 +6,21 @@ import google.generativeai as genai
 from google.generativeai.types import generation_types
 # Import the core API exceptions to catch more error types
 from google.api_core import exceptions as api_core_exceptions
-# Import libraries for image processing and JSON
+# Import libraries for image processing, JSON, and regex
 import io
 import json
+import re
 from PIL import Image
 
-# --- ✅ NEW: Configuration Loading ---
+# --- Configuration Loading ---
 # Define file paths for external configuration
 KEYS_FILE = "keys.json"
 PERSONA_FILE = "persona.txt"
-HISTORY_FILE = "chat_history.json"
+USER_NOTES_FILE = "user_notes.json"
+META_PERSONA_FILE = "meta_persona.txt"
+# ✅ Re-introduced the chat history file for permanent logging
+CHAT_HISTORY_FILE = "chat_history.json"
+DEV_GUILD_ID = 123456789012345678 # Replace with your actual Server ID
 
 def load_keys(filepath):
     """Loads Discord and Gemini keys from the keys.json file."""
@@ -31,19 +36,19 @@ def load_keys(filepath):
         print(f"Error loading {filepath}: {e}. Please ensure the file exists and is correctly formatted.")
         exit()
 
-def load_persona(filepath):
-    """Loads the persona from a text file."""
+def load_text_file(filepath):
+    """Loads text content from a file."""
     try:
         with open(filepath, 'r', encoding='utf-8') as f:
             return f.read()
     except FileNotFoundError:
-        print(f"Error: The persona file '{filepath}' was not found.")
+        print(f"Error: The file '{filepath}' was not found.")
         exit()
 
 # Load configurations from files
 DISCORD_TOKEN, GEMINI_API_KEYS = load_keys(KEYS_FILE)
-PERSONA = load_persona(PERSONA_FILE)
-# --- END OF NEW CONFIGURATION LOGIC ---
+PERSONA = load_text_file(PERSONA_FILE)
+META_PERSONA = load_text_file(META_PERSONA_FILE)
 
 
 # --- State Management for API Keys ---
@@ -58,49 +63,90 @@ safety_settings = {
 }
 
 # --- Gemini API Setup ---
-def create_model():
+def create_model(persona=PERSONA):
     """Creates a new GenerativeModel instance with the current key and safety settings."""
+    if not GEMINI_API_KEYS:
+        print("Error: No Gemini API keys found in keys.json. Exiting.")
+        exit()
     api_key = GEMINI_API_KEYS[current_api_key_index]
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
         'gemini-2.5-flash',
-        system_instruction=PERSONA,
+        system_instruction=persona,
         safety_settings=safety_settings
     )
 
 model = create_model()
 
-# --- Chat Session Management ---
-chat_sessions = {}
-
-# --- Chat History Persistence Functions ---
-def save_chat_history(channel_id, history):
-    """Saves the chat history for a specific channel to the JSON file."""
+# --- User Notes & History Persistence Functions ---
+def load_user_notes(user_id):
+    """Loads the notes for a specific user from the JSON file."""
     try:
-        with open(HISTORY_FILE, 'r') as f:
+        with open(USER_NOTES_FILE, 'r') as f:
+            all_notes = json.load(f)
+        return all_notes.get(str(user_id), "No notes on this user yet.")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "No notes on this user yet."
+
+def save_user_notes(user_id, notes):
+    """Saves the updated notes for a specific user to the JSON file."""
+    try:
+        with open(USER_NOTES_FILE, 'r') as f:
+            all_notes = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        all_notes = {}
+    
+    all_notes[str(user_id)] = notes
+    
+    with open(USER_NOTES_FILE, 'w') as f:
+        json.dump(all_notes, f, indent=4)
+
+async def update_notes_with_gemini(user_id, conversation_summary):
+    """Uses Gemini to intelligently update the notes for a user."""
+    print(f"Updating notes for user {user_id}...")
+    existing_notes = load_user_notes(user_id)
+    
+    meta_model = create_model(persona=META_PERSONA)
+    
+    update_prompt = (
+        f"**Existing Notes on User <@{user_id}>:**\n{existing_notes}\n\n"
+        f"**Recent Conversation Summary:**\n{conversation_summary}\n\n"
+        "Please update the notes based on this new information. Keep it concise."
+    )
+    
+    try:
+        response = await meta_model.generate_content_async(update_prompt)
+        if response.text:
+            new_notes = response.text
+            save_user_notes(user_id, new_notes)
+            print(f"Successfully updated notes for user {user_id}.")
+        else:
+            print(f"Meta-model failed to generate updated notes for user {user_id}.")
+    except Exception as e:
+        print(f"An error occurred during note update for user {user_id}: {e}")
+
+# ✅ NEW: Function to log raw conversations for archival
+def log_to_chat_history(channel_id, user_prompt_parts, bot_response_text):
+    """Logs the raw user prompt and bot response to the chat_history.json file."""
+    try:
+        with open(CHAT_HISTORY_FILE, 'r') as f:
             all_histories = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         all_histories = {}
 
-    serializable_history = []
-    for content in history:
-        text_parts = [part.text for part in content.parts if hasattr(part, 'text')]
-        if text_parts:
-            serializable_history.append({'role': content.role, 'parts': text_parts})
+    channel_id_str = str(channel_id)
+    if channel_id_str not in all_histories:
+        all_histories[channel_id_str] = []
 
-    all_histories[str(channel_id)] = serializable_history
+    # Format user prompt for logging (text parts only)
+    user_log_parts = [part for part in user_prompt_parts if isinstance(part, str)]
+    
+    # Append the user message and bot response
+    all_histories[channel_id_str].append({'role': 'user', 'parts': user_log_parts})
+    all_histories[channel_id_str].append({'role': 'model', 'parts': [bot_response_text]})
 
-    with open(HISTORY_FILE, 'w') as f:
+    with open(CHAT_HISTORY_FILE, 'w') as f:
         json.dump(all_histories, f, indent=4)
-
-def load_chat_history(channel_id):
-    """Loads the chat history for a specific channel from the JSON file."""
-    try:
-        with open(HISTORY_FILE, 'r') as f:
-            all_histories = json.load(f)
-        return all_histories.get(str(channel_id), [])
-    except (FileNotFoundError, json.JSONDecodeError):
-        return []
 
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
@@ -113,15 +159,22 @@ def rotate_api_key():
     current_api_key_index = (current_api_key_index + 1) % len(GEMINI_API_KEYS)
     print(f"Switching to API Key index {current_api_key_index}")
     model = create_model()
-    chat_sessions.clear()
 
 @bot.event
 async def on_ready():
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
+        if DEV_GUILD_ID:
+            guild = discord.Object(id=DEV_GUILD_ID)
+            bot.tree.copy_global_to(guild=guild)
+            await bot.tree.sync(guild=guild)
+            print(f"Synced commands to development guild: {DEV_GUILD_ID}")
+        else:
+            await bot.tree.sync()
+            print("Synced commands globally.")
+            
     except Exception as e:
         print(e)
+        
     print(f'Logged in as {bot.user}')
     print(f'Using API Key index {current_api_key_index}')
     print('------')
@@ -129,29 +182,14 @@ async def on_ready():
 @bot.tree.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
 async def gemini(interaction: discord.Interaction, prompt: str = None, attachment: discord.Attachment = None):
     await interaction.response.defer()
+    user_id = interaction.user.id
     channel_id = interaction.channel.id
-
-    history_prompt = ""
-    try:
-        history_prompt_list = []
-        async for message in interaction.channel.history(limit=5, before=interaction.created_at):
-            if message.author != bot.user:
-                 history_prompt_list.append(f"<@{message.author.id}> said: {message.content}")
-        history_prompt_list.reverse()
-        history_prompt = "\n".join(history_prompt_list)
-    except discord.Forbidden:
-        print(f"Warning: Cannot read history in channel '{interaction.channel.name}' ({interaction.channel.id}).")
-        pass
-    except Exception as e:
-        print(f"An unexpected error occurred while fetching history: {e}")
-        pass
     
-    final_prompt_parts = []
-    if history_prompt:
-        final_prompt_parts.append(f"Here is the recent conversation history:\n{history_prompt}\n")
+    user_notes = load_user_notes(user_id)
+    final_prompt_parts = [f"Here are my notes on this user: {user_notes}\n\n"]
 
     if prompt:
-        final_prompt_parts.append(f"<@{interaction.user.id}> said: {prompt}")
+        final_prompt_parts.append(f"<@{user_id}> said: {prompt}")
     
     if attachment:
         if "image" in attachment.content_type:
@@ -160,7 +198,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
                 img = Image.open(io.BytesIO(image_bytes))
                 final_prompt_parts.append(img)
                 if not prompt:
-                     final_prompt_parts.insert(1, f"<@{interaction.user.id}> sent an image. Please describe or react to it.")
+                     final_prompt_parts.append(f"\n<@{user_id}> sent an image. Please describe or react to it.")
             except Exception as e:
                 await interaction.followup.send(content=f"I had trouble reading that image file. Error: {e}")
                 return
@@ -168,26 +206,28 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             await interaction.followup.send(content="Sorry, I can only process image files right now.", ephemeral=True)
             return
 
-    if not final_prompt_parts:
+    if len(final_prompt_parts) <= 1 and not attachment:
         await interaction.followup.send(content="Please provide a prompt or an image.", ephemeral=True)
         return
     
-    if channel_id not in chat_sessions:
-        history = load_chat_history(channel_id)
-        chat_sessions[channel_id] = model.start_chat(history=history)
-
-    chat = chat_sessions[channel_id]
     print(f"Slash command prompt parts: {final_prompt_parts}")
 
     try:
-        response = await chat.send_message_async(final_prompt_parts)
+        response = await model.generate_content_async(final_prompt_parts)
         if not response.parts:
             print("API response was empty. Rotating key.")
             rotate_api_key()
             await interaction.followup.send(content="There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
         else:
-            await interaction.followup.send(content=response.text)
-            save_chat_history(channel_id, chat.history)
+            bot_response_text = response.text
+            await interaction.followup.send(content=bot_response_text)
+            # Log the raw interaction
+            log_to_chat_history(channel_id, final_prompt_parts, bot_response_text)
+            # Update the user's notes
+            user_prompt_text = prompt or "Sent an image"
+            summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
+            await update_notes_with_gemini(user_id, summary)
+            
     except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
         print(f"API Error: {e}. Rotating key.")
         rotate_api_key()
@@ -219,15 +259,18 @@ async def on_message(message):
     contains_natural_trigger = any(phrase in content_lower for phrase in natural_trigger_phrases)
 
     if is_dm or is_reply_to_bot or contains_mention or contains_natural_trigger:
+        user_id = message.author.id
         channel_id = message.channel.id
         
-        prompt_parts = []
+        user_notes = load_user_notes(user_id)
+        prompt_parts = [f"Here are my notes on this user: {user_notes}\n\n"]
+        
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_message = message.reference.resolved
             prompt_parts.append(f"<@{original_message.author.id}> said: '{original_message.content}'\n\n"
-                                f"<@{message.author.id}> replied: '{message.content}'")
+                                f"<@{user_id}> replied: '{message.content}'")
         else:
-            prompt_parts.append(f"<@{message.author.id}> said: {message.content}")
+            prompt_parts.append(f"<@{user_id}> said: {message.content}")
 
         for attachment in message.attachments:
             if "image" in attachment.content_type:
@@ -244,23 +287,24 @@ async def on_message(message):
              print("Ignoring message with no text or valid images.")
              return
 
-        if channel_id not in chat_sessions:
-            history = load_chat_history(channel_id)
-            chat_sessions[channel_id] = model.start_chat(history=history)
-
-        chat = chat_sessions[channel_id]
         print(f"Message prompt parts: {prompt_parts}")
 
         try:
             async with message.channel.typing():
-                response = await chat.send_message_async(prompt_parts)
+                response = await model.generate_content_async(prompt_parts)
                 if not response.parts:
                     print("API response was empty. Rotating key.")
                     rotate_api_key()
                     await message.reply("There was a hiccup with the API. I've switched to a backup key, please try your prompt again.")
                 else:
-                    await message.reply(response.text)
-                    save_chat_history(channel_id, chat.history)
+                    bot_response_text = response.text
+                    await message.reply(bot_response_text)
+                    # Log the raw interaction
+                    log_to_chat_history(channel_id, prompt_parts, bot_response_text)
+                    # Update the user's notes
+                    summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
+                    await update_notes_with_gemini(user_id, summary)
+
         except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
             print(f"API Error: {e}. Rotating key.")
             rotate_api_key()
@@ -269,5 +313,65 @@ async def on_message(message):
             print(f"An unexpected API error occurred: {e}. Rotating key.")
             rotate_api_key()
             await message.reply("An unexpected API error occurred. I've switched to a backup key, please try again.")
+
+@bot.tree.command(name="initialize_notes", description="[Owner Only] Creates initial user notes from chat history.")
+@commands.is_owner()
+async def initialize_notes(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    print("Starting user notes initialization...")
+
+    try:
+        with open(CHAT_HISTORY_FILE, 'r') as f:
+            old_history = json.load(f)
+    except FileNotFoundError:
+        await interaction.followup.send(f"Error: The `{CHAT_HISTORY_FILE}` was not found. No notes were created.")
+        return
+    except json.JSONDecodeError:
+        await interaction.followup.send(f"Error: Could not read `{CHAT_HISTORY_FILE}`. It may be corrupted.")
+        return
+
+    user_conversations = {}
+    user_id_pattern = re.compile(r"<@(\d+)>")
+
+    for channel_id, messages in old_history.items():
+        for message in messages:
+            if message['role'] == 'user':
+                full_text = " ".join(message['parts'])
+                match = user_id_pattern.search(full_text)
+                if match:
+                    user_id = match.group(1)
+                    if user_id not in user_conversations:
+                        user_conversations[user_id] = []
+                    user_conversations[user_id].append(full_text)
+
+    if not user_conversations:
+        await interaction.followup.send("No user conversations found in the chat history file.")
+        return
+
+    meta_model = create_model(persona=META_PERSONA)
+    initialized_users = 0
+    for user_id, texts in user_conversations.items():
+        print(f"Generating notes for user {user_id}...")
+        full_conversation = "\n".join(texts)
+        
+        prompt = (
+            f"Please analyze the following conversation history for user <@{user_id}> and create a concise set of initial notes about their personality, "
+            "interests, and key topics they discuss. Focus on creating a summary that would be useful for future interactions.\n\n"
+            f"**Conversation History:**\n{full_conversation}"
+        )
+        
+        try:
+            response = await meta_model.generate_content_async(prompt)
+            if response.text:
+                save_user_notes(user_id, response.text)
+                print(f"Successfully created notes for user {user_id}.")
+                initialized_users += 1
+            else:
+                print(f"Failed to generate notes for user {user_id} (empty response).")
+        except Exception as e:
+            print(f"An error occurred while generating notes for user {user_id}: {e}")
+            
+    # ✅ Removed the "temporary" wording from the confirmation message
+    await interaction.followup.send(f"Initialization complete! Created or updated notes for {initialized_users} user(s).")
 
 bot.run(DISCORD_TOKEN)
