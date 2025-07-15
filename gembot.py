@@ -54,7 +54,7 @@ META_PERSONA = load_text_file(META_PERSONA_FILE)
 
 
 # --- State Management for API Keys ---
-current_api_key_index = 6
+current_api_key_index = 0
 
 # --- Safety Settings Configuration ---
 safety_settings = {
