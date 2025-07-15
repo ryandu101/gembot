@@ -21,7 +21,7 @@ META_PERSONA_FILE = "meta_persona.txt"
 CHAT_HISTORY_FILE = "chat_history.json"
 DEV_GUILD_ID = 123456789012345678 # Replace with your actual Server ID
 # Set the short-term memory window (in conversation turns)
-SHORT_TERM_MEMORY_TURNS = 5 
+SHORT_TERM_MEMORY_TURNS = 10 
 
 
 def load_keys(filepath):
@@ -70,10 +70,12 @@ def create_model(persona=PERSONA):
     if not GEMINI_API_KEYS:
         print("Error: No Gemini API keys found in keys.json. Exiting.")
         exit()
-    api_key = GEMINI_API_KEYS[current_api_key_index]
+    # Ensure the index is always valid
+    safe_index = current_api_key_index % len(GEMINI_API_KEYS)
+    api_key = GEMINI_API_KEYS[safe_index]
     genai.configure(api_key=api_key)
     return genai.GenerativeModel(
-        'gemini-2.5-flash',
+        'gemini-2.5-pro',
         system_instruction=persona,
         safety_settings=safety_settings
     )
@@ -246,29 +248,44 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
     
     print(log_message)
 
-    try:
-        response = await model.generate_content_async(final_prompt_parts)
-        if not response.parts:
-            await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
-        else:
-            bot_response_text = response.text
-            await interaction.followup.send(content=bot_response_text)
-            log_to_chat_history(channel_id, [log_message], bot_response_text)
-            user_prompt_text = prompt or "Sent an image"
-            summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
-            await update_notes_with_gemini(user_id, summary)
-            
-    # --- ✅ NEW: Refined Error Handling ---
-    except api_core_exceptions.ResourceExhausted as e:
-        print(f"Quota exceeded: {e}. Rotating key.")
-        rotate_api_key()
-        await interaction.followup.send(content=f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
-    except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
-        print(f"Prompt-related API Error: {e}")
-        await interaction.followup.send(content=f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        await interaction.followup.send(content=f"An unexpected error occurred: `{e}`")
+    # --- ✅ NEW: Automatic Retry Logic ---
+    response = None
+    for attempt in range(len(GEMINI_API_KEYS)):
+        try:
+            response = await model.generate_content_async(final_prompt_parts)
+            # If the call succeeds, break the loop
+            break 
+        except api_core_exceptions.ResourceExhausted as e:
+            print(f"Quota exceeded on key {current_api_key_index}. Rotating key. Attempt {attempt + 1}/{len(GEMINI_API_KEYS)}")
+            rotate_api_key()
+            # If this was the last key, send a failure message
+            if attempt == len(GEMINI_API_KEYS) - 1:
+                await interaction.followup.send(content=f"All API keys have reached their quota. Please try again later.\n`{e}`")
+                return
+        except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
+            print(f"Prompt-related API Error: {e}")
+            await interaction.followup.send(content=f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
+            return # Don't retry for these errors
+        except Exception as e:
+            print(f"An unexpected error occurred: {e}")
+            await interaction.followup.send(content=f"An unexpected error occurred: `{e}`")
+            return # Don't retry for other unexpected errors
+
+    # After the loop, check if we got a valid response
+    if response and response.parts:
+        bot_response_text = response.text
+        await interaction.followup.send(content=bot_response_text)
+        log_to_chat_history(channel_id, [log_message], bot_response_text)
+        user_prompt_text = prompt or "Sent an image"
+        summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
+        await update_notes_with_gemini(user_id, summary)
+    elif not response:
+         # This case is hit if all keys failed with quota errors
+         print("All API keys failed.")
+         # The failure message is already sent inside the loop
+    else: # Response was received but was empty
+        await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
+
 
 @bot.event
 async def on_message(message):
@@ -331,29 +348,39 @@ async def on_message(message):
 
         print(log_message)
 
-        try:
-            async with message.channel.typing():
-                response = await model.generate_content_async(prompt_parts)
-                if not response.parts:
-                    await message.reply("My response was blocked or empty. This might be due to the prompt or safety filters.")
-                else:
-                    bot_response_text = response.text
-                    await message.reply(bot_response_text)
-                    log_to_chat_history(channel_id, [log_message], bot_response_text, message.id)
-                    summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
-                    await update_notes_with_gemini(user_id, summary)
+        # --- ✅ NEW: Automatic Retry Logic ---
+        response = None
+        for attempt in range(len(GEMINI_API_KEYS)):
+            try:
+                async with message.channel.typing():
+                    response = await model.generate_content_async(prompt_parts)
+                break # Success
+            except api_core_exceptions.ResourceExhausted as e:
+                print(f"Quota exceeded on key {current_api_key_index}. Rotating key. Attempt {attempt + 1}/{len(GEMINI_API_KEYS)}")
+                rotate_api_key()
+                if attempt == len(GEMINI_API_KEYS) - 1:
+                    await message.reply(f"All API keys have reached their quota. Please try again later.\n`{e}`")
+                    return
+            except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
+                print(f"Prompt-related API Error: {e}")
+                await message.reply(f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
+                return
+            except Exception as e:
+                print(f"An unexpected error occurred: {e}")
+                await message.reply(f"An unexpected error occurred: `{e}`")
+                return
 
-        # --- ✅ NEW: Refined Error Handling ---
-        except api_core_exceptions.ResourceExhausted as e:
-            print(f"Quota exceeded: {e}. Rotating key.")
-            rotate_api_key()
-            await message.reply(f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
-        except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
-            print(f"Prompt-related API Error: {e}")
-            await message.reply(f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
-        except Exception as e:
-            print(f"An unexpected error occurred: {e}")
-            await message.reply(f"An unexpected error occurred: `{e}`")
+        if response and response.parts:
+            bot_response_text = response.text
+            await message.reply(bot_response_text)
+            log_to_chat_history(channel_id, [log_message], bot_response_text, message.id)
+            summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
+            await update_notes_with_gemini(user_id, summary)
+        elif not response:
+            print("All API keys failed.")
+        else:
+            await message.reply("My response was blocked or empty. This might be due to the prompt or safety filters.")
+
 
 @bot.tree.command(name="initialize_notes", description="[Owner Only] Creates initial user notes from chat history.")
 @commands.is_owner()
