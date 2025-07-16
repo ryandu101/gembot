@@ -5,6 +5,7 @@ persona.txt
 chat_history.json
 meta_persona.txt
 user_notes.json
+channel_ids.json
 
 # --- Python ---
 # Ignore virtual environment folders
