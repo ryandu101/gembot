@@ -19,7 +19,7 @@ PERSONA_FILE = "persona.txt"
 USER_NOTES_FILE = "user_notes.json"
 META_PERSONA_FILE = "meta_persona.txt"
 CHAT_HISTORY_FILE = "chat_history.json"
-# ✅ NEW: Add channel whitelist file
+# Add channel whitelist file
 CHANNEL_IDS_FILE = "channel_ids.json"
 DEV_GUILD_ID = 930444180520570930 # Replace with your actual Server ID
 # Set the short-term memory window (in conversation turns)
@@ -130,7 +130,8 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     )
     
     try:
-        response = await meta_model.generate_content_async(update_prompt)
+        # We can use a simpler retry for the background task to avoid complexity
+        response = await model.generate_content_async(update_prompt)
         if response.text:
             new_notes = response.text
             save_user_notes(user_id, new_notes)
@@ -174,6 +175,7 @@ def rotate_api_key():
     global current_api_key_index, model
     current_api_key_index = (current_api_key_index + 1) % len(GEMINI_API_KEYS)
     print(f"Switching to API Key index {current_api_key_index}")
+    # Re-create the model with the new key
     model = create_model()
 
 # --- Unified Context Building Function ---
@@ -186,6 +188,7 @@ def build_context_prompt(user_id, channel_id):
             all_histories = json.load(f)
         
         channel_history = all_histories.get(str(channel_id), [])
+        # Get the last N turns (1 turn = 1 user + 1 model)
         recent_history = channel_history[-(SHORT_TERM_MEMORY_TURNS * 2):]
         
         history_lines = []
@@ -206,16 +209,18 @@ def build_context_prompt(user_id, channel_id):
     
     return context_parts
 
-# --- ✅ NEW: Helper function to send long messages ---
+# --- Helper function to send long messages ---
 async def send_long_message(context, text):
     """Splits a long message into chunks of 2000 characters and sends them."""
     if len(text) <= 2000:
+        # Check if context is an Interaction or a Message
         if isinstance(context, discord.Interaction):
             await context.followup.send(content=text)
         else:
             await context.reply(text)
         return
 
+    # Split the text into chunks
     chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
     for i, chunk in enumerate(chunks):
         if i == 0:
@@ -224,6 +229,7 @@ async def send_long_message(context, text):
             else:
                 await context.reply(chunk)
         else:
+            # Send subsequent chunks to the channel
             await context.channel.send(content=chunk)
 
 @bot.event
@@ -235,6 +241,7 @@ async def on_ready():
             await bot.tree.sync(guild=guild)
             print(f"Synced commands to development guild: {DEV_GUILD_ID}")
         else:
+            # Sync commands globally if no dev guild is specified
             await bot.tree.sync()
             print("Synced commands globally.")
     except Exception as e:
@@ -242,6 +249,38 @@ async def on_ready():
     print(f'Logged in as {bot.user}')
     print(f'Using API Key index {current_api_key_index}')
     print('------')
+
+# --- START MODIFICATION ---
+async def generate_with_full_rotation(prompt_parts):
+    """Generates content, rotating through all available API keys on ResourceExhausted errors."""
+    num_keys = len(GEMINI_API_KEYS)
+    if num_keys == 0:
+        raise ValueError("Cannot generate content: No Gemini API keys found.")
+
+    last_exception = None
+
+    for attempt in range(num_keys):
+        try:
+            print(f"Attempting API call with key index {current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
+            response = await model.generate_content_async(prompt_parts)
+            # Success! Return the response immediately.
+            return response
+        except api_core_exceptions.ResourceExhausted as e:
+            print(f"Key index {current_api_key_index} is over quota.")
+            last_exception = e
+            # Rotate to the next key for the next attempt in the loop.
+            rotate_api_key()
+        except Exception as e:
+            # For any other kind of error (e.g., BlockedPromptException), fail immediately
+            # as trying another key won't help.
+            print(f"Encountered a non-retriable error: {e}")
+            raise e
+            
+    # If the loop completes, it means all keys failed. Raise the last captured exception.
+    print("All available API keys are exhausted.")
+    if last_exception:
+        raise last_exception
+# --- END MODIFICATION ---
 
 @bot.tree.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
 async def gemini(interaction: discord.Interaction, prompt: str = None, attachment: discord.Attachment = None):
@@ -265,6 +304,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
                 final_prompt_parts.append(img)
                 log_message += " and an image attachment."
                 if not prompt:
+                     # Add a default prompt if only an image is sent
                      final_prompt_parts.append(f"\n<@{user_id}> sent an image. Please describe or react to it.")
             except Exception as e:
                 await interaction.followup.send(content=f"I had trouble reading that image file. Error: {e}")
@@ -280,21 +320,28 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
     print(log_message)
 
     try:
-        response = await model.generate_content_async(final_prompt_parts)
+        # --- START MODIFICATION ---
+        response = await generate_with_full_rotation(final_prompt_parts)
+        # --- END MODIFICATION ---
+        
         if not response.parts:
             await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
         else:
             bot_response_text = response.text
             await send_long_message(interaction, bot_response_text)
             log_to_chat_history(channel_id, [log_message], bot_response_text)
+            
+            # Create summary for note update
             user_prompt_text = prompt or "Sent an image"
             summary = f"User Prompt: '{user_prompt_text}'\nBot Response: '{bot_response_text}'"
             await update_notes_with_gemini(user_id, summary)
             
+    # --- START MODIFICATION ---
     except api_core_exceptions.ResourceExhausted as e:
-        print(f"Quota exceeded: {e}. Rotating key.")
-        rotate_api_key()
-        await interaction.followup.send(content=f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
+        # This now only triggers after all keys have been tried and failed.
+        print(f"Final error after cycling through all keys: {e}.")
+        await interaction.followup.send(content=f"I'm sorry, but all of my available API keys are currently over quota. Please try again in a few minutes.\n`{e}`")
+    # --- END MODIFICATION ---
     except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
         print(f"Prompt-related API Error: {e}")
         await interaction.followup.send(content=f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
@@ -302,15 +349,18 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
         print(f"An unexpected error occurred: {e}")
         await interaction.followup.send(content=f"An unexpected error occurred: `{e}`")
 
+
 @bot.event
 async def on_message(message):
-    # ✅ Implement channel whitelist check
+    # Ignore messages in channels not on the whitelist
     if message.guild and message.channel.id not in ALLOWED_CHANNEL_IDS:
         return
 
+    # Ignore messages from the bot itself
     if message.author == bot.user:
         return
 
+    # Define triggers for the bot to respond
     mention_triggers = ['gemini', 'gem']
     natural_trigger_phrases = [
         "how do you", "how does", "how do i", "what is the best way to", "what's the difference between",
@@ -325,8 +375,10 @@ async def on_message(message):
     is_dm = isinstance(message.channel, discord.DMChannel)
     is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == bot.user
     contains_mention = any(word in content_lower for word in mention_triggers)
-    contains_natural_trigger = any(phrase in content_lower for phrase in natural_trigger_phrases)
+    # Check if the message starts with a natural trigger phrase
+    contains_natural_trigger = any(content_lower.startswith(phrase) for phrase in natural_trigger_phrases)
 
+    # Respond if it's a DM, a reply to the bot, or contains a trigger word
     if is_dm or is_reply_to_bot or contains_mention or contains_natural_trigger:
         user_id = message.author.id
         channel_id = message.channel.id
@@ -335,9 +387,12 @@ async def on_message(message):
         
         log_message = f"<@{user_id}> said: '{message.content}'"
         
+        # Handle replies
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_message = message.reference.resolved
-            prompt_parts.append(f"\n<@{original_message.author.id}> said: '{original_message.content}'")
+            # Add context from the replied-to message
+            prompt_parts.append(f"\nContext: In reply to a message from <@{original_message.author.id}> that said: '{original_message.content}'")
+            # Process attachments in the replied-to message
             for attachment in original_message.attachments:
                 if "image" in attachment.content_type:
                     try:
@@ -348,8 +403,10 @@ async def on_message(message):
                         print(f"Could not process replied image: {e}")
             prompt_parts.append(f"\n\n<@{user_id}> replied: '{message.content}'")
         else:
+            # Handle regular messages
             prompt_parts.append(f"\n<@{user_id}> said: {message.content}")
 
+        # Process attachments in the new message
         for attachment in message.attachments:
             if "image" in attachment.content_type:
                 try:
@@ -359,8 +416,10 @@ async def on_message(message):
                 except Exception as e:
                     print(f"Could not process new image: {e}")
             else:
+                # Inform the model about non-viewable attachments
                 prompt_parts.append(f"\n(User also attached a file named '{attachment.filename}' that cannot be viewed.)")
         
+        # Don't respond to empty messages (e.g., only an attachment that failed to load)
         if not message.content.strip() and not any(isinstance(p, Image.Image) for p in prompt_parts):
              print("Ignoring message with no text or valid images.")
              return
@@ -368,21 +427,28 @@ async def on_message(message):
         print(log_message)
 
         try:
+            # Show a typing indicator while generating the response
             async with message.channel.typing():
-                response = await model.generate_content_async(prompt_parts)
+                # --- START MODIFICATION ---
+                response = await generate_with_full_rotation(prompt_parts)
+                # --- END MODIFICATION ---
+
                 if not response.parts:
                     await message.reply("My response was blocked or empty. This might be due to the prompt or safety filters.")
                 else:
                     bot_response_text = response.text
                     await send_long_message(message, bot_response_text)
+                    # Log conversation for context and note-taking
                     log_to_chat_history(channel_id, [log_message], bot_response_text, message.id)
                     summary = f"User Prompt: '{message.content}'\nBot Response: '{bot_response_text}'"
                     await update_notes_with_gemini(user_id, summary)
 
+        # --- START MODIFICATION ---
         except api_core_exceptions.ResourceExhausted as e:
-            print(f"Quota exceeded: {e}. Rotating key.")
-            rotate_api_key()
-            await message.reply(f"API Quota Exceeded. I've switched to a backup key. Please try again.\n`{e}`")
+            # This now only triggers after all keys have been tried and failed.
+            print(f"Final error after cycling through all keys: {e}.")
+            await message.reply(f"I'm sorry, but all of my available API keys are currently over quota. Please try again in a few minutes.\n`{e}`")
+        # --- END MODIFICATION ---
         except (generation_types.BlockedPromptException, api_core_exceptions.InvalidArgument) as e:
             print(f"Prompt-related API Error: {e}")
             await message.reply(f"There was an issue with the prompt (it might be too long, empty, or blocked).\n`{e}`")
@@ -407,15 +473,18 @@ async def initialize_notes(interaction: discord.Interaction):
         return
 
     user_conversations = {}
+    # Regex to find user IDs in logged messages
     user_id_pattern = re.compile(r"<@(\d+)>")
 
     for channel_id, messages in old_history.items():
         for message in messages:
             if message['role'] == 'user':
                 full_text = " ".join(message['parts'])
+                # Find the user ID in the logged message
                 match = user_id_pattern.search(full_text)
                 if match:
                     user_id = match.group(1)
+                    # Initialize a list for the user if not already present
                     if user_id not in user_conversations:
                         user_conversations[user_id] = []
                     user_conversations[user_id].append(full_text)
@@ -483,6 +552,7 @@ async def condense_all_notes(interaction: discord.Interaction):
             response = await meta_model.generate_content_async(condensation_prompt)
             if response.text:
                 new_notes = response.text
+                # Overwrite the old notes with the new condensed version
                 all_notes[user_id] = new_notes
                 print(f"Successfully condensed notes for user {user_id}.")
                 condensed_count += 1
@@ -493,12 +563,12 @@ async def condense_all_notes(interaction: discord.Interaction):
             print(f"An error occurred during note condensation for user {user_id}: {e}")
             error_count += 1
     
+    # Save the updated notes back to the file
     with open(USER_NOTES_FILE, 'w') as f:
         json.dump(all_notes, f, indent=4)
 
     await interaction.followup.send(f"Condensation complete! Successfully processed notes for {condensed_count} user(s). Failed to process {error_count} user(s).")
 
-# --- ✅ NEW: Command to create user notes from a channel's history ---
 @bot.tree.command(name="createnotes", description="[Owner Only] Creates/rewrites notes for a user from this channel's history.")
 @commands.is_owner()
 async def createnotes(interaction: discord.Interaction, user: discord.User):
@@ -507,7 +577,7 @@ async def createnotes(interaction: discord.Interaction, user: discord.User):
     print(f"Starting note creation for user {target_user_id} from channel {interaction.channel.id}...")
 
     user_messages = []
-    # Limit to last 5000 messages to avoid extreme processing times
+    # Limit to the last 5000 messages to avoid extreme processing times
     async for message in interaction.channel.history(limit=5000):
         if message.author.id == target_user_id:
             user_messages.append(message.content)
@@ -516,7 +586,7 @@ async def createnotes(interaction: discord.Interaction, user: discord.User):
         await interaction.followup.send(f"No recent messages found for user <@{target_user_id}> in this channel.")
         return
 
-    # Reverse to get chronological order
+    # Reverse the list to get chronological order
     user_messages.reverse()
     full_conversation = "\n".join(user_messages)
 
