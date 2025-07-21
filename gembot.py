@@ -328,7 +328,13 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
         else:
             bot_response_text = response.text
-            await send_long_message(interaction, bot_response_text)
+            # --- START MODIFICATION ---
+            if prompt:
+                response_with_prompt = f"> {prompt}\n\n{bot_response_text}"
+                await send_long_message(interaction, response_with_prompt)
+            else:
+                await send_long_message(interaction, bot_response_text)
+            # --- END MODIFICATION ---
             log_to_chat_history(channel_id, [log_message], bot_response_text)
             
             # Create summary for note update
