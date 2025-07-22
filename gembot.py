@@ -27,7 +27,7 @@ CHANNEL_IDS_FILE = os.path.join(SCRIPT_DIR, "channel_ids.json")
 
 DEV_GUILD_ID = 977180402743672902 # Replace with your actual Server ID
 # Set the short-term memory window (in conversation turns)
-SHORT_TERM_MEMORY_TURNS = 100
+SHORT_TERM_MEMORY_TURNS = 400
 
 
 def load_keys(filepath):
@@ -481,7 +481,7 @@ async def build_chat_history(interaction: discord.Interaction):
     message_count = 0
     print("Fetching channel message history...")
     
-    async for message in interaction.channel.history(limit=None, oldest_first=True):
+    async for message in interaction.channel.history(limit=10000, oldest_first=True):
         if not message.content and not message.attachments:
             continue # Skip messages with no text or attachments
 
