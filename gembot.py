@@ -272,6 +272,12 @@ async def generate_with_full_rotation(prompt_parts):
 # --- MODIFIED RESPONSE PROCESSING LOGIC ---
 async def process_and_send_response(ctx, response):
     """Processes model response for text, code, and images, then sends to Discord."""
+    # --- FIX: Add a guard clause to handle empty/blocked responses ---
+    if not response or not response.parts:
+        # This function shouldn't even be called if the response is empty,
+        # but this makes it safer. We'll send a generic error from the calling command.
+        return "" # Return an empty string to prevent downstream errors.
+
     files_to_send = []
     
     # First, find and prepare any generated images
