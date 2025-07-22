@@ -11,6 +11,9 @@ import io
 import json
 import re
 from PIL import Image
+# --- NEW: Import for fuzzy string matching ---
+from thefuzz import fuzz
+
 
 # --- Configuration Loading ---
 # Define file paths for external configuration
@@ -121,8 +124,9 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     print(f"Updating notes for user {user_id}...")
     existing_notes = load_user_notes(user_id)
     
-    meta_model = create_model(persona=META_PERSONA)
-    
+    # Use a faster model for the meta-task
+    meta_model = genai.GenerativeModel('gemini-1.5-flash', system_instruction=META_PERSONA)
+
     update_prompt = (
         f"**Existing Notes on User <@{user_id}>:**\n{existing_notes}\n\n"
         f"**Recent Conversation Summary:**\n{conversation_summary}\n\n"
@@ -130,7 +134,7 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     )
     
     try:
-        response = await model.generate_content_async(update_prompt)
+        response = await meta_model.generate_content_async(update_prompt)
         if response.text:
             new_notes = response.text
             save_user_notes(user_id, new_notes)
@@ -167,6 +171,8 @@ def log_to_chat_history(channel_id, user_prompt_parts, bot_response_text, messag
 # --- Discord Bot Setup ---
 intents = discord.Intents.default()
 intents.message_content = True
+# --- NEW: Enable members intent for name matching ---
+intents.members = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 
 def rotate_api_key():
@@ -176,11 +182,64 @@ def rotate_api_key():
     print(f"Switching to API Key index {current_api_key_index}")
     model = create_model()
 
-# --- Unified Context Building Function ---
-def build_context_prompt(user_id, channel_id):
-    """Builds the prompt context using long-term notes and short-term history."""
-    user_notes = load_user_notes(user_id)
+# --- NEW: Smart User Identification Function ---
+async def get_mentioned_user_ids(message: discord.Message) -> list[str]:
+    """
+    Identifies all users mentioned in a message using direct mentions,
+    replies, and fuzzy name matching.
+    """
+    user_ids = {str(message.author.id)}
+
+    # 1. Add IDs from direct @mentions
+    for user in message.mentions:
+        user_ids.add(str(user.id))
+
+    # 2. Add ID from the user being replied to
+    if message.reference and isinstance(message.reference.resolved, discord.Message):
+        user_ids.add(str(message.reference.resolved.author.id))
+
+    # 3. Fuzzy match names against the message content
+    if message.guild:
+        SIMILARITY_THRESHOLD = 50  # Score out of 100. Adjust as needed.
+
+        for member in message.channel.members:
+            # Skip checking against the author or already found users
+            if str(member.id) in user_ids:
+                continue
+            
+            # Use partial_ratio to find name mentions even if they are substrings
+            ratio = fuzz.partial_ratio(member.display_name.lower(), message.content.lower())
+            
+            if ratio >= SIMILARITY_THRESHOLD:
+                print(f"Fuzzy Match Found: Matched '{member.display_name}' with ratio {ratio}.")
+                user_ids.add(str(member.id))
+
+    return list(user_ids)
+
+
+# --- MODIFIED: Context Building Function ---
+def build_context_prompt(author_id: str, relevant_user_ids: list[str], channel_id: int) -> list[str]:
+    """Builds the prompt context using notes from all relevant users and short-term history."""
+    context_parts = []
     
+    # Load notes for the author first, as they are the primary user
+    author_notes = load_user_notes(author_id)
+    context_parts.append(f"### My Long-Term Notes on the author, <@{author_id}>:\n{author_notes}\n")
+
+    # Load notes for other mentioned/discussed users
+    other_user_ids = [uid for uid in relevant_user_ids if uid != author_id]
+    if other_user_ids:
+        other_notes_parts = []
+        for user_id in other_user_ids:
+            user_notes = load_user_notes(user_id)
+            if "No notes on this user yet." not in user_notes:
+                other_notes_parts.append(f"--- Notes on <@{user_id}> ---\n{user_notes}")
+        
+        if other_notes_parts:
+            full_other_notes = "\n".join(other_notes_parts)
+            context_parts.append(f"### For context, here are my notes on other users being discussed:\n{full_other_notes}\n")
+
+    # Append short-term memory
     try:
         with open(CHAT_HISTORY_FILE, 'r') as f:
             all_histories = json.load(f)
@@ -188,21 +247,13 @@ def build_context_prompt(user_id, channel_id):
         channel_history = all_histories.get(str(channel_id), [])
         recent_history = channel_history[-(SHORT_TERM_MEMORY_TURNS * 2):]
         
-        history_lines = []
-        for entry in recent_history:
-            role = "Gem" if entry['role'] == 'model' else "User"
-            content = " ".join(entry['parts'])
-            history_lines.append(f"{role}: {content}")
-        
+        history_lines = [f"{'Gem' if entry['role'] == 'model' else 'User'}: {' '.join(entry['parts'])}" for entry in recent_history]
         short_term_memory = "\n".join(history_lines)
 
     except (FileNotFoundError, json.JSONDecodeError):
         short_term_memory = "No chat history found."
-
-    context_parts = [
-        f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
-        f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
-    ]
+    
+    context_parts.append(f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n")
     
     return context_parts
 
@@ -218,12 +269,14 @@ async def send_long_message(ctx, text, files=None):
 
     chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
     for i, chunk in enumerate(chunks):
-        # Send files only with the first chunk
         attached_files = files if i == 0 else None
         if isinstance(ctx, discord.Interaction):
-            await ctx.followup.send(content=chunk, files=attached_files)
+            # For interactions, only the first response is a followup, subsequent are sends
+            if i == 0:
+                 await ctx.followup.send(content=chunk, files=attached_files)
+            else:
+                 await ctx.channel.send(content=chunk)
         else:
-            # For on_message, we can only reply once. Send subsequent chunks to the channel.
             if i == 0:
                 await ctx.reply(chunk, files=attached_files)
             else:
@@ -269,36 +322,26 @@ async def generate_with_full_rotation(prompt_parts):
     if last_exception:
         raise last_exception
 
-# --- MODIFIED RESPONSE PROCESSING LOGIC ---
 async def process_and_send_response(ctx, response):
     """Processes model response for text, code, and images, then sends to Discord."""
-    # --- FIX: Add a guard clause to handle empty/blocked responses ---
     if not response or not response.parts:
-        # This function shouldn't even be called if the response is empty,
-        # but this makes it safer. We'll send a generic error from the calling command.
-        return "" # Return an empty string to prevent downstream errors.
+        return "" 
 
     files_to_send = []
     
-    # First, find and prepare any generated images
     image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
     if image_parts:
         for i, part in enumerate(image_parts):
             image_data = part.inline_data.data
             files_to_send.append(discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png"))
     
-    # Combine all text parts into a single string
     full_text = "".join([p.text for p in response.parts if p.text])
     
-    # If an image was generated, clean up the text response
     if files_to_send:
-        # Remove the bracketed image descriptions, which are now redundant
         bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip()
-        # If the text is now empty, use a default message
         if not bot_response_text:
             bot_response_text = "Here is the image you requested!"
     else:
-        # If no image, check for code blocks to attach as a file
         code_block_match = re.search(r"```(?:\w+)?\n([\s\S]+?)\n```", full_text)
         if code_block_match:
             code_content = code_block_match.group(1)
@@ -307,28 +350,41 @@ async def process_and_send_response(ctx, response):
             
             code_file = io.BytesIO(code_content.encode('utf-8'))
             files_to_send.append(discord.File(code_file, filename=f"generated_code.{extension}"))
-            
-            # Use a cleaner message when sending a code file
             bot_response_text = "I've generated the code you asked for and attached it as a file."
         else:
             bot_response_text = full_text
 
     await send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
     return bot_response_text
-# --- END MODIFIED LOGIC ---
 
 
 @bot.tree.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
 async def gemini(interaction: discord.Interaction, prompt: str = None, attachment: discord.Attachment = None):
     await interaction.response.defer()
-    user_id = interaction.user.id
+    
+    # --- MODIFIED: Context generation using new functions ---
+    # Create a simplified message-like object for our helper function
+    pseudo_message = type('PseudoMessage', (), {
+        'author': interaction.user,
+        'mentions': [], # Slash commands don't easily provide a list of mentioned users
+        'reference': None,
+        'content': prompt or "",
+        'guild': interaction.guild,
+        'channel': interaction.channel,
+        'attachments': [attachment] if attachment else []
+    })
+
+    relevant_user_ids = await get_mentioned_user_ids(pseudo_message)
+    author_id = str(interaction.user.id)
     channel_id = interaction.channel.id
     
-    final_prompt_parts = build_context_prompt(user_id, channel_id)
-    log_message = f"<@{user_id}> used /gemini"
+    final_prompt_parts = build_context_prompt(author_id, relevant_user_ids, channel_id)
+    # --- END of modifications ---
+    
+    log_message = f"<@{author_id}> used /gemini"
 
     if prompt:
-        final_prompt_parts.append(f"\n<@{user_id}> said: {prompt}")
+        final_prompt_parts.append(f"\n<@{author_id}> said: {prompt}")
         log_message += f" with prompt: '{prompt}'"
     
     if attachment:
@@ -339,7 +395,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
                 final_prompt_parts.append(img)
                 log_message += f" and an image attachment: {attachment.filename}"
                 if not prompt:
-                     final_prompt_parts.append(f"\n<@{user_id}> sent an image. Please describe or react to it.")
+                     final_prompt_parts.append(f"\n<@{author_id}> sent an image. Please describe or react to it.")
             except Exception as e:
                 await interaction.followup.send(content=f"I had trouble reading that image file. Error: {e}")
                 return
@@ -348,7 +404,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             log_message += f" and a file attachment: {attachment.filename}"
 
     if not prompt and not attachment:
-        final_prompt_parts.append(f"\n<@{user_id}> has continued the conversation without adding a new message. Please respond based on the context.")
+        final_prompt_parts.append(f"\n<@{author_id}> has continued the conversation without adding a new message. Please respond based on the context.")
         log_message += " to continue the conversation."
     
     print(log_message)
@@ -360,12 +416,12 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
             await interaction.followup.send(content="My response was blocked or empty. This might be due to the prompt or safety filters.")
             return
 
-        # --- USE THE NEW RESPONSE PROCESSOR ---
         final_bot_text = await process_and_send_response(interaction, response)
         
         log_to_chat_history(channel_id, [log_message], final_bot_text, interaction.id)
         summary = f"User Prompt: '{prompt or 'Attachment'}'\nBot Response: '{final_bot_text}'"
-        await update_notes_with_gemini(user_id, summary)
+        # Update notes for the author only
+        await update_notes_with_gemini(author_id, summary)
             
     except api_core_exceptions.ResourceExhausted as e:
         await interaction.followup.send(content=f"I'm sorry, but all of my available API keys are currently over quota. Please try again in a few minutes.\n`{e}`")
@@ -377,7 +433,7 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
 
 @bot.event
 async def on_message(message):
-    if message.guild and message.channel.id not in ALLOWED_CHANNEL_IDS or message.author == bot.user:
+    if message.author == bot.user or (message.guild and message.channel.id not in ALLOWED_CHANNEL_IDS):
         return
 
     mention_triggers = ['gemini', 'gem']
@@ -396,11 +452,17 @@ async def on_message(message):
     contains_natural_trigger = any(content_lower.startswith(phrase) for phrase in natural_trigger_phrases)
 
     if is_dm or is_reply_to_bot or contains_mention or contains_natural_trigger:
-        user_id = message.author.id
+        # --- MODIFIED: Context generation using new functions ---
+        author_id = str(message.author.id)
         channel_id = message.channel.id
+
+        # Directly call our new function with the real message object
+        relevant_user_ids = await get_mentioned_user_ids(message)
         
-        prompt_parts = build_context_prompt(user_id, channel_id)
-        log_message = f"<@{user_id}> said: '{message.content}'"
+        prompt_parts = build_context_prompt(author_id, relevant_user_ids, channel_id)
+        # --- END of modifications ---
+        
+        log_message = f"<@{author_id}> said: '{message.content}'"
         
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_message = message.reference.resolved
@@ -415,9 +477,9 @@ async def on_message(message):
                         print(f"Could not process replied image: {e}")
                 else:
                     prompt_parts.append(f"\n(Replying to a message that included a non-viewable file named '{attachment.filename}'.)")
-            prompt_parts.append(f"\n\n<@{user_id}> replied: '{message.content}'")
+            prompt_parts.append(f"\n\n<@{author_id}> replied: '{message.content}'")
         else:
-            prompt_parts.append(f"\n<@{user_id}> said: {message.content}")
+            prompt_parts.append(f"\n<@{author_id}> said: {message.content}")
 
         for attachment in message.attachments:
             if "image" in attachment.content_type:
@@ -445,12 +507,12 @@ async def on_message(message):
                     await message.reply("My response was blocked or empty. This might be due to the prompt or safety filters.")
                     return
                 
-                # --- USE THE NEW RESPONSE PROCESSOR ---
                 final_bot_text = await process_and_send_response(message, response)
 
                 log_to_chat_history(channel_id, [log_message], final_bot_text, message.id)
                 summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
-                await update_notes_with_gemini(user_id, summary)
+                # Update notes for the author only
+                await update_notes_with_gemini(author_id, summary)
 
         except api_core_exceptions.ResourceExhausted as e:
             await message.reply(f"I'm sorry, but all of my available API keys are currently over quota. Please try again in a few minutes.\n`{e}`")
