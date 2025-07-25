@@ -27,7 +27,7 @@ CHANNEL_IDS_FILE = os.path.join(SCRIPT_DIR, "channel_ids.json")
 
 DEV_GUILD_ID = 977180402743672902 # Replace with your actual Server ID
 # Set the short-term memory window (in conversation turns)
-SHORT_TERM_MEMORY_TURNS = 500
+SHORT_TERM_MEMORY_TURNS = 800
 
 
 def load_keys(filepath):
