@@ -27,7 +27,7 @@ CHANNEL_IDS_FILE = os.path.join(SCRIPT_DIR, "channel_ids.json")
 
 DEV_GUILD_ID = 977180402743672902 # Replace with your actual Server ID
 # Set the short-term memory window (in conversation turns)
-SHORT_TERM_MEMORY_TURNS = 400
+SHORT_TERM_MEMORY_TURNS = 800
 
 
 def load_keys(filepath):
@@ -394,7 +394,7 @@ async def on_message(message):
     if message.guild and message.channel.id not in ALLOWED_CHANNEL_IDS or message.author == bot.user:
         return
 
-    mention_triggers = ['gemini', 'gem']
+    mention_triggers = ['gemini', 'gem', '1023352997977276417']
     natural_trigger_phrases = [
         "how do you", "how does", "how do i", "what is the best way to", "what's the difference between",
         "what are the pros and cons", "what happens if", "can anyone explain", "can someone explain",
