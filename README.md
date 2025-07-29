@@ -1,3 +1,4 @@
+If you want to try this out for yourself:
 You need to make your own persona.txt, meta_persona.txt, user_notes.json, chat_history.json, channel_ids.json, and keys.json files.
 I recommend giving ai gembot.py and asking it how to help you set-up.
 
