@@ -134,21 +134,17 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     )
     
     try:
-        # --- FIX 1: Use the correct model for the API call ---
         response = await meta_model.generate_content_async(update_prompt)
         
-        # --- FIX 2: Add a robust check for a valid response before accessing .text ---
-        # This prevents the 'NoneType' is not iterable crash.
         if not response or not response.parts:
             print(f"Meta-model returned a blocked or empty response for user {user_id}.")
-            return # Exit gracefully
+            return
 
         if response.text:
             new_notes = response.text.strip()
             save_user_notes(user_id, new_notes)
             print(f"Successfully updated notes for user {user_id}.")
         else:
-            # This case might be reached if the response has parts, but none are text.
             print(f"Meta-model failed to generate text notes for user {user_id}.")
             
     except Exception as e:
@@ -212,21 +208,20 @@ def build_context_prompt(user_id, channel_id):
             all_histories = json.load(f)
         
         channel_history = all_histories.get(str(channel_id), [])
-        # Each "turn" is now one entry, but we still grab user + model pairs, so *2 is correct.
         recent_history = channel_history[-(SHORT_TERM_MEMORY_TURNS * 2):]
         
         history_lines = []
         for entry in recent_history:
-            # Check for the new structured format and include author_id and timestamp
-            if isinstance(entry, dict) and all(k in entry for k in ['author_name', 'content', 'author_id', 'timestamp']):
-                author = entry['author_name']
-                author_id = entry['author_id']
-                timestamp = entry['timestamp']
-                # Indent multiline content for readability
-                content = entry['content'].replace('\n', '\n' + ' ' * (len(author) + 2)) 
-                history_lines.append(f"[{timestamp}] {author} ({author_id}): {content}")
+            if isinstance(entry, dict) and all(k in entry for k in ['author_name', 'content', 'author_id', 'timestamp', 'role']):
+                history_entry_dict = {
+                    "role": entry['role'],
+                    "timestamp": entry['timestamp'],
+                    "author_id": entry['author_id'],
+                    "author_name": entry['author_name'],
+                    "content": entry['content']
+                }
+                history_lines.append(json.dumps(history_entry_dict))
             else:
-                # Fallback for old format or malformed data
                 print(f"Warning: Skipping malformed/old history entry in channel {channel_id}: {entry}")
 
         short_term_memory = "\n".join(history_lines)
@@ -234,8 +229,18 @@ def build_context_prompt(user_id, channel_id):
     except (FileNotFoundError, json.JSONDecodeError):
         short_term_memory = "No chat history found."
 
+    # --- INJECT CONTEXT INSTRUCTIONS HERE ---
+    context_instructions = (
+        "Instructions for reading conversation history:\n"
+        "The following is a transcript of the recent conversation. Each message is a self-contained JSON object.\n"
+        "You MUST parse these JSON objects to understand the conversation flow. The 'content' field contains the message text.\n"
+        "Do not output your own responses in JSON format unless specifically asked to. Respond naturally based on the content within the JSON.\n"
+        "--- End of Instructions ---\n"
+    )
+
     context_parts = [
         f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
+        context_instructions,
         f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
     ]
     
@@ -253,16 +258,13 @@ async def send_long_message(ctx, text, files=None):
 
     chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
     for i, chunk in enumerate(chunks):
-        # Send files only with the first chunk
         attached_files = files if i == 0 else None
         if isinstance(ctx, discord.Interaction):
-            # For interactions, followup.send creates new messages
             if i == 0:
                  await ctx.followup.send(content=chunk, files=attached_files)
             else:
                  await ctx.channel.send(content=chunk)
         else:
-            # For on_message, we can only reply once. Send subsequent chunks to the channel.
             if i == 0:
                 await ctx.reply(chunk, files=attached_files)
             else:
@@ -272,11 +274,9 @@ async def send_long_message(ctx, text, files=None):
 @bot.event
 async def on_ready():
     try:
-        # Sync commands globally first
         await bot.tree.sync()
         print("Synced commands globally.")
 
-        # Then, sync to the development guild for immediate testing
         if DEV_GUILD_ID:
             guild = discord.Object(id=DEV_GUILD_ID)
             await bot.tree.sync(guild=guild)
@@ -314,38 +314,28 @@ async def generate_with_full_rotation(prompt_parts):
 async def process_and_send_response(ctx, response):
     """Processes model response for text, code, and images, then sends to Discord."""
     try:
-        # This guard clause should handle most empty/blocked cases.
         if not response or not response.parts:
-            # Returning an empty string will cause the calling command to send a "blocked" message.
             return ""
 
         files_to_send = []
         
-        # Find and prepare any generated images
         image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
         if image_parts:
             for i, part in enumerate(image_parts):
                 image_data = part.inline_data.data
                 files_to_send.append(discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png"))
         
-        # Combine all text parts into a single string
         full_text = "".join([p.text for p in response.parts if p.text])
         
     except TypeError:
-        # This will now catch the "'NoneType' object is not iterable" error if it happens here.
         print(f"DEBUG: A TypeError occurred in process_and_send_response. This indicates a malformed response from the API where response.parts was not iterable.")
-        # Return an empty string to signal a failure to the calling command.
         return ""
 
-    # If an image was generated, clean up the text response
     if files_to_send:
-        # Remove the bracketed image descriptions, which are now redundant
         bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip()
-        # If the text is now empty, use a default message
         if not bot_response_text:
             bot_response_text = "Here is the image you requested!"
     else:
-        # If no image, check for code blocks to attach as a file
         code_block_match = re.search(r"```(?:\w+)?\n([\s\S]+?)\n```", full_text)
         if code_block_match:
             code_content = code_block_match.group(1)
@@ -355,7 +345,6 @@ async def process_and_send_response(ctx, response):
             code_file = io.BytesIO(code_content.encode('utf-8'))
             files_to_send.append(discord.File(code_file, filename=f"generated_code.{extension}"))
             
-            # Use a cleaner message when sending a code file
             bot_response_text = "I've generated the code you asked for and attached it as a file."
         else:
             bot_response_text = full_text
@@ -372,9 +361,15 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
     
     final_prompt_parts = build_context_prompt(user_id, channel_id)
     user_content_for_log = prompt if prompt else ""
-
-    if prompt:
-        final_prompt_parts.append(f"\n{interaction.user.display_name} said: {prompt}")
+    
+    # --- UNIFIED JSON INPUT FORMATTING ---
+    current_input_dict = {
+        "role": "user",
+        "timestamp": interaction.created_at.isoformat(),
+        "author_id": user_id,
+        "author_name": interaction.user.display_name,
+        "content": prompt or ""
+    }
     
     if attachment:
         user_content_for_log += f" [Attached file: {attachment.filename}]"
@@ -384,16 +379,18 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
                 img = Image.open(io.BytesIO(image_bytes))
                 final_prompt_parts.append(img)
                 if not prompt:
-                     final_prompt_parts.append(f"\n{interaction.user.display_name} sent an image. Please describe or react to it.")
+                    current_input_dict["content"] = "[User sent an image. Please describe or react to it.]"
             except Exception as e:
                 await interaction.followup.send(content=f"I had trouble reading that image file. Error: {e}")
                 return
         else:
-            final_prompt_parts.append(f"\n(User also attached a file named '{attachment.filename}' that cannot be viewed.)")
+            current_input_dict["content"] += f" (User also attached a file named '{attachment.filename}' that cannot be viewed.)"
 
     if not prompt and not attachment:
-        final_prompt_parts.append(f"\n{interaction.user.display_name} has continued the conversation without adding a new message.")
+        current_input_dict["content"] = "[User has continued the conversation without adding a new message.]"
         user_content_for_log = "[Continuation without text]"
+
+    final_prompt_parts.append(json.dumps(current_input_dict))
     
     print(f"{interaction.user.display_name} ({user_id}) used /gemini in channel {channel_id}")
 
@@ -406,7 +403,6 @@ async def gemini(interaction: discord.Interaction, prompt: str = None, attachmen
 
         final_bot_text = await process_and_send_response(interaction, response)
         
-        # Use the new logging function
         log_to_chat_history(channel_id, interaction.user, interaction.created_at, user_content_for_log.strip(), final_bot_text)
 
         summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'"
@@ -446,14 +442,19 @@ async def on_message(message):
         
         prompt_parts = build_context_prompt(user_id, channel_id)
         
+        # --- UNIFIED JSON INPUT FORMATTING ---
+        current_input_dict = {
+            "role": "user",
+            "timestamp": message.created_at.isoformat(),
+            "author_id": user_id,
+            "author_name": message.author.display_name,
+            "content": message.content
+        }
+        
         if message.reference and isinstance(message.reference.resolved, discord.Message):
             original_message = message.reference.resolved
-            prompt_parts.append(f"\nContext: In reply to a message from {original_message.author.display_name} that said: '{original_message.content}'")
-            # Image handling for replies...
-            prompt_parts.append(f"\n\n{message.author.display_name} replied: '{message.content}'")
-        else:
-            prompt_parts.append(f"\n{message.author.display_name} said: {message.content}")
-
+            current_input_dict['content'] = f"[In reply to '{original_message.author.display_name}']: {message.content}"
+        
         for attachment in message.attachments:
             if "image" in attachment.content_type:
                 try:
@@ -462,11 +463,13 @@ async def on_message(message):
                 except Exception as e:
                     print(f"Could not process new image: {e}")
             else:
-                prompt_parts.append(f"\n(User also attached a file named '{attachment.filename}' that cannot be viewed.)")
-        
+                 current_input_dict["content"] += f" (User also attached a file named '{attachment.filename}' that cannot be viewed.)"
+
         if not message.content.strip() and not any(isinstance(p, Image.Image) for p in prompt_parts):
              print("Ignoring message with no text or valid images.")
              return
+
+        prompt_parts.append(json.dumps(current_input_dict))
 
         print(f"{message.author.display_name} ({user_id}) triggered bot in channel {channel_id}")
 
@@ -480,7 +483,6 @@ async def on_message(message):
                 
                 final_bot_text = await process_and_send_response(message, response)
 
-                # Use the new logging function
                 log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
 
                 summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
@@ -514,7 +516,7 @@ async def build_chat_history(interaction: discord.Interaction):
     
     async for message in interaction.channel.history(limit=10000, oldest_first=True):
         if not message.content and not message.attachments:
-            continue # Skip messages with no text or attachments
+            continue
 
         role = 'model' if message.author.bot else 'user'
         
@@ -555,7 +557,6 @@ async def initialize_notes(interaction: discord.Interaction):
 
     for channel_id, messages in all_histories.items():
         for message in messages:
-            # Ensure entry is valid and from a non-bot user
             if isinstance(message, dict) and message.get('role') == 'user':
                 user_id = str(message.get('author_id'))
                 if not user_id: continue
@@ -563,7 +564,6 @@ async def initialize_notes(interaction: discord.Interaction):
                 if user_id not in user_conversations:
                     user_conversations[user_id] = []
                 
-                # Add the content to the user's conversation list
                 content = message.get('content', '')
                 if content:
                     user_conversations[user_id].append(content)
@@ -600,16 +600,14 @@ async def initialize_notes(interaction: discord.Interaction):
 @bot.tree.command(name="condense_all_notes", description="[Owner Only] Condenses all user notes to reduce size.")
 @commands.is_owner()
 async def condense_all_notes(interaction: discord.Interaction):
-    # This command does not need changes as it only interacts with user_notes.json
     await interaction.response.defer(ephemeral=True)
-    # ... (rest of the function is unchanged)
+    # ... (function is unchanged)
 
 @bot.tree.command(name="createnotes", description="[Owner Only] Creates/rewrites notes for a user from this channel's history.")
 @commands.is_owner()
 async def createnotes(interaction: discord.Interaction, user: discord.User):
-    # This command does not need changes as it reads history directly
     await interaction.response.defer(ephemeral=True)
-    # ... (rest of the function is unchanged)
+    # ... (function is unchanged)
 
 
 bot.run(DISCORD_TOKEN)
