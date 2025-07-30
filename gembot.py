@@ -134,13 +134,23 @@ async def update_notes_with_gemini(user_id, conversation_summary):
     )
     
     try:
-        response = await model.generate_content_async(update_prompt)
+        # --- FIX 1: Use the correct model for the API call ---
+        response = await meta_model.generate_content_async(update_prompt)
+        
+        # --- FIX 2: Add a robust check for a valid response before accessing .text ---
+        # This prevents the 'NoneType' is not iterable crash.
+        if not response or not response.parts:
+            print(f"Meta-model returned a blocked or empty response for user {user_id}.")
+            return # Exit gracefully
+
         if response.text:
-            new_notes = response.text
+            new_notes = response.text.strip()
             save_user_notes(user_id, new_notes)
             print(f"Successfully updated notes for user {user_id}.")
         else:
-            print(f"Meta-model failed to generate updated notes for user {user_id}.")
+            # This case might be reached if the response has parts, but none are text.
+            print(f"Meta-model failed to generate text notes for user {user_id}.")
+            
     except Exception as e:
         print(f"An error occurred during note update for user {user_id}: {e}")
 
@@ -192,7 +202,7 @@ def rotate_api_key():
     print(f"Switching to API Key index {current_api_key_index}")
     model = create_model()
 
-# --- UPDATED CONTEXT BUILDING FUNCTION ---
+# --- MODIFIED CONTEXT BUILDING FUNCTION ---
 def build_context_prompt(user_id, channel_id):
     """Builds the prompt context using long-term notes and short-term history from the new format."""
     user_notes = load_user_notes(user_id)
@@ -207,13 +217,16 @@ def build_context_prompt(user_id, channel_id):
         
         history_lines = []
         for entry in recent_history:
-            # Check for the new structured format
-            if isinstance(entry, dict) and 'author_name' in entry and 'content' in entry:
+            # Check for the new structured format and include author_id and timestamp
+            if isinstance(entry, dict) and all(k in entry for k in ['author_name', 'content', 'author_id', 'timestamp']):
                 author = entry['author_name']
-                content = entry['content'].replace('\n', '\n' + ' ' * (len(author) + 2)) # Indent multiline content
-                history_lines.append(f"{author}: {content}")
+                author_id = entry['author_id']
+                timestamp = entry['timestamp']
+                # Indent multiline content for readability
+                content = entry['content'].replace('\n', '\n' + ' ' * (len(author) + 2)) 
+                history_lines.append(f"[{timestamp}] {author} ({author_id}): {content}")
             else:
-                # Fallback for old format or malformed data, can be removed later
+                # Fallback for old format or malformed data
                 print(f"Warning: Skipping malformed/old history entry in channel {channel_id}: {entry}")
 
         short_term_memory = "\n".join(history_lines)
@@ -297,26 +310,42 @@ async def generate_with_full_rotation(prompt_parts):
     if last_exception:
         raise last_exception
 
+# --- MODIFIED RESPONSE PROCESSING LOGIC ---
 async def process_and_send_response(ctx, response):
     """Processes model response for text, code, and images, then sends to Discord."""
-    if not response or not response.parts:
-        return "" 
+    try:
+        # This guard clause should handle most empty/blocked cases.
+        if not response or not response.parts:
+            # Returning an empty string will cause the calling command to send a "blocked" message.
+            return ""
 
-    files_to_send = []
-    
-    image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
-    if image_parts:
-        for i, part in enumerate(image_parts):
-            image_data = part.inline_data.data
-            files_to_send.append(discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png"))
-    
-    full_text = "".join([p.text for p in response.parts if p.text])
-    
+        files_to_send = []
+        
+        # Find and prepare any generated images
+        image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
+        if image_parts:
+            for i, part in enumerate(image_parts):
+                image_data = part.inline_data.data
+                files_to_send.append(discord.File(io.BytesIO(image_data), filename=f"generated_image_{i+1}.png"))
+        
+        # Combine all text parts into a single string
+        full_text = "".join([p.text for p in response.parts if p.text])
+        
+    except TypeError:
+        # This will now catch the "'NoneType' object is not iterable" error if it happens here.
+        print(f"DEBUG: A TypeError occurred in process_and_send_response. This indicates a malformed response from the API where response.parts was not iterable.")
+        # Return an empty string to signal a failure to the calling command.
+        return ""
+
+    # If an image was generated, clean up the text response
     if files_to_send:
+        # Remove the bracketed image descriptions, which are now redundant
         bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip()
+        # If the text is now empty, use a default message
         if not bot_response_text:
             bot_response_text = "Here is the image you requested!"
     else:
+        # If no image, check for code blocks to attach as a file
         code_block_match = re.search(r"```(?:\w+)?\n([\s\S]+?)\n```", full_text)
         if code_block_match:
             code_content = code_block_match.group(1)
@@ -326,12 +355,14 @@ async def process_and_send_response(ctx, response):
             code_file = io.BytesIO(code_content.encode('utf-8'))
             files_to_send.append(discord.File(code_file, filename=f"generated_code.{extension}"))
             
+            # Use a cleaner message when sending a code file
             bot_response_text = "I've generated the code you asked for and attached it as a file."
         else:
             bot_response_text = full_text
 
     await send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
     return bot_response_text
+# --- END MODIFIED LOGIC ---
 
 @bot.tree.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
 async def gemini(interaction: discord.Interaction, prompt: str = None, attachment: discord.Attachment = None):
