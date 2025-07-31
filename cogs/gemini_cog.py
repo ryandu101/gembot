@@ -347,13 +347,21 @@ class GeminiCog(commands.Cog):
         if message.author.bot or (message.guild and message.channel.id not in self.allowed_channel_ids):
             return
 
+        # --- CORRECTED TRIGGER LOGIC ---
+        # Define the keywords and natural phrases that should trigger the bot
+        mention_triggers = ['1392960230228492508', 'gem']
+        content_lower = message.content.lower()
+
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == self.bot.user
-        contains_mention = self.bot.user.mentioned_in(message)
         
-        # Only trigger on mention, reply, or in a DM
+        # Check for direct @mention OR if 'gem'/'gemini' are in the message
+        contains_mention = self.bot.user.mentioned_in(message) or any(word in content_lower for word in mention_triggers)
+
+        # Only trigger if one of the conditions is met
         if not (is_dm or is_reply_to_bot or contains_mention):
             return
+        # --- END OF CORRECTION ---
 
         async with message.channel.typing():
             user_id = message.author.id
@@ -371,11 +379,9 @@ class GeminiCog(commands.Cog):
                     except Exception as e:
                         print(f"Could not process image in on_message: {e}")
                 else:
-                    # Note non-viewable files within the prompt content
                     user_content += f" (Note: User also attached a non-image file named '{attachment.filename}')"
 
-            # 3. Add the current user's message, safely wrapped inside the secure block.
-            # The model will see the user's real name and ID as the author of the entire `user_content`.
+            # 3. Add the current user's message, safely wrapped
             prompt_parts.append(f"\n{message.author.display_name} (<@{user_id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
 
             print(f"Secure prompt initiated by {message.author.display_name} ({user_id}) in channel {channel_id}")
@@ -388,7 +394,7 @@ class GeminiCog(commands.Cog):
                 
                 final_bot_text = await self._process_and_send_response(message, response)
                 
-                # Log history and update notes as before
+                # Log history and update notes
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
                 summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
                 await self._update_notes_with_gemini(user_id, summary)
