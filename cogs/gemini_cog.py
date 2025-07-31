@@ -176,36 +176,45 @@ class GeminiCog(commands.Cog):
             print(f"An error occurred during note update for user {user_id}: {e}")
 
     def _build_context_prompt(self, user_id, channel_id):
-        # This builds the full context with history and notes
+        """Builds a secure and structured prompt context to prevent injection."""
         user_notes = self._load_user_notes(user_id)
         
+        # Define clear, non-natural separators for the history block
+        history_header = "--- BEGIN CONVERSATION HISTORY ---"
+        history_footer = "--- END CONVERSATION HISTORY ---"
+        
         try:
-            with open(self.config_files["history"], 'r') as f:
+            with open(self.config_files["history"], 'r', encoding='utf-8') as f:
                 all_histories = json.load(f)
             
             channel_history = all_histories.get(str(channel_id), [])
-            # Limit history to avoid overly long prompts
-            recent_history = channel_history[-(self.short_term_memory_turns * 2):] 
+            recent_history = channel_history[-(self.short_term_memory_turns * 2):]
             
-            history_lines = [json.dumps(entry) for entry in recent_history if isinstance(entry, dict)]
+            history_lines = []
+            for entry in recent_history:
+                # Use a simple "Author: Message" format for clarity
+                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
+                    author_name = entry.get('author_name', 'Unknown')
+                    content = entry.get('content', '')
+                    history_lines.append(f"{author_name}: {content}")
+            
             short_term_memory = "\n".join(history_lines)
 
         except (FileNotFoundError, json.JSONDecodeError):
-            short_term_memory = "No chat history found."
+            short_term_memory = "No chat history found for this channel."
 
-        context_instructions = (
-            "Instructions for reading conversation history:\n"
-            "The following is a transcript of the recent conversation. Each message is a self-contained JSON object.\n"
-            "You MUST parse these JSON objects to understand the conversation flow. The 'content' field contains the message text.\n"
-            "Do not output your own responses in JSON format unless specifically asked to. Respond naturally based on the content.\n"
-            "--- End of Instructions ---\n"
+        # This new structure clearly separates each piece of context for the model.
+        # The most important part is the "CURRENT USER PROMPT" block, which isolates the user's new message.
+        context_string = (
+            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n\n"
+            f"{history_header}\n"
+            f"{short_term_memory}\n"
+            f"{history_footer}\n\n"
+            "--- BEGIN CURRENT USER PROMPT ---" # This wrapper is key to the security
         )
-
-        return [
-            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
-            context_instructions,
-            f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
-        ]
+        
+        # The base context is returned. The calling function will add the actual user message.
+        return [context_string]
 
     # --- Helper and Response Processing Methods ---
     async def _send_long_message(self, ctx, text, files=None):
@@ -334,13 +343,11 @@ class GeminiCog(commands.Cog):
     # triggers in allowed channels, so it doesn't need changes.
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Ignore messages outside allowed channels, from bots, or without content
+        # Standard checks: ignore bots, ensure channel is allowed
         if message.author.bot or (message.guild and message.channel.id not in self.allowed_channel_ids):
             return
 
         is_dm = isinstance(message.channel, discord.DMChannel)
-        
-        # Logic to decide if the bot should respond
         is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == self.bot.user
         contains_mention = self.bot.user.mentioned_in(message)
         
@@ -352,36 +359,36 @@ class GeminiCog(commands.Cog):
             user_id = message.author.id
             channel_id = message.channel.id
             
-            # Since this only runs in allowed channels, always build full context
+            # 1. Build the secure base context
             prompt_parts = self._build_context_prompt(user_id, channel_id)
             
-            current_input_dict = {
-                "role": "user", "timestamp": message.created_at.isoformat(),
-                "author_id": user_id, "author_name": message.author.display_name, "content": message.content
-            }
-            
+            # 2. Safely prepare the user's content and handle any attachments
+            user_content = message.content
             for attachment in message.attachments:
                 if "image" in attachment.content_type:
                     try:
                         prompt_parts.append(Image.open(io.BytesIO(await attachment.read())))
                     except Exception as e:
                         print(f"Could not process image in on_message: {e}")
-                else: # Note non-image files in the content
-                    current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
+                else:
+                    # Note non-viewable files within the prompt content
+                    user_content += f" (Note: User also attached a non-image file named '{attachment.filename}')"
 
-            prompt_parts.append(json.dumps(current_input_dict))
+            # 3. Add the current user's message, safely wrapped inside the secure block.
+            # The model will see the user's real name and ID as the author of the entire `user_content`.
+            prompt_parts.append(f"\n{message.author.display_name} (<@{user_id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
 
-            print(f"{message.author.display_name} ({user_id}) triggered bot via message in channel {channel_id}")
+            print(f"Secure prompt initiated by {message.author.display_name} ({user_id}) in channel {channel_id}")
 
             try:
                 response = await self._generate_with_full_rotation(prompt_parts, persona=self.persona)
                 if not response or not response.parts:
-                    await message.reply("My response was blocked or empty. This may be due to safety filters.")
+                    await message.reply("My response was blocked or empty. This might be due to safety filters.")
                     return
                 
                 final_bot_text = await self._process_and_send_response(message, response)
                 
-                # Log history and update notes
+                # Log history and update notes as before
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
                 summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
                 await self._update_notes_with_gemini(user_id, summary)
