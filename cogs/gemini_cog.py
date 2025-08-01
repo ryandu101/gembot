@@ -23,6 +23,55 @@ class GeminiCog(commands.Cog):
         # --- Load Configurations ---
         self.persona = self._load_text_file(self.config_files["persona"])
         self.meta_persona = self._load_text_file(self.config_files["meta_persona"])
+        
+        # --- CORRECTED PART ---
+        # Call _load_keys once and correctly unpack all three expected values
+        _, self.gemini_api_keys, self.lastfm_api_key = self._load_keys(self.config_files["keys"])
+        # --- END OF CORRECTION ---
+
+        self.allowed_channel_ids = self._load_allowed_channels(self.config_files["channels"])
+        
+        # --- Load Last.fm API and create an instance ---
+        self.last_fm = LastFm(self.lastfm_api_key)
+
+        # --- Define the Last.fm tool for Gemini ---
+        self.lastfm_tool = content_types.Tool(
+            function_declarations=[
+                content_types.FunctionDeclaration(
+                    name='get_top_artists',
+                    description='Fetches the top 5 most played artists for a given Last.fm username.',
+                    parameters=protos.Schema(
+                        type=protos.Type.OBJECT,
+                        properties={
+                            'username': protos.Schema(type=protos.Type.STRING, description='The username on Last.fm')
+                        },
+                        required=['username']
+                    )
+                )
+            ]
+        )
+        
+        # --- State Management ---
+        self.current_api_key_index = 0
+        self.short_term_memory_turns = 800
+
+        # --- Safety Settings ---
+        self.safety_settings = {
+            "HARM_CATEGORY_HARASSMENT": "BLOCK_NONE",
+            "HARM_CATEGORY_HATE_SPEECH": "BLOCK_NONE",
+            "HARM_CATEGORY_SEXUALLY_EXPLICIT": "BLOCK_NONE",
+            "HARM_CATEGORY_DANGEROUS_CONTENT": "BLOCK_NONE",
+        }
+
+        # --- Initialize Gemini Model ---
+        self.model = self._create_model(persona=self.persona)
+        print("GeminiCog loaded and initialized.")
+        self.bot = bot
+        self.config_files = bot.config_files
+        
+        # --- Load Configurations ---
+        self.persona = self._load_text_file(self.config_files["persona"])
+        self.meta_persona = self._load_text_file(self.config_files["meta_persona"])
         _, self.gemini_api_keys = self._load_keys(self.config_files["keys"])
         self.allowed_channel_ids = self._load_allowed_channels(self.config_files["channels"])
         
