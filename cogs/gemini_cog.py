@@ -179,7 +179,6 @@ class GeminiCog(commands.Cog):
         """Builds a secure and structured prompt context to prevent injection."""
         user_notes = self._load_user_notes(user_id)
         
-        # Define clear, non-natural separators for the history block
         history_header = "--- BEGIN CONVERSATION HISTORY ---"
         history_footer = "--- END CONVERSATION HISTORY ---"
         
@@ -192,7 +191,6 @@ class GeminiCog(commands.Cog):
             
             history_lines = []
             for entry in recent_history:
-                # Use a simple "Author: Message" format for clarity
                 if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
                     author_name = entry.get('author_name', 'Unknown')
                     content = entry.get('content', '')
@@ -203,17 +201,14 @@ class GeminiCog(commands.Cog):
         except (FileNotFoundError, json.JSONDecodeError):
             short_term_memory = "No chat history found for this channel."
 
-        # This new structure clearly separates each piece of context for the model.
-        # The most important part is the "CURRENT USER PROMPT" block, which isolates the user's new message.
         context_string = (
             f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n\n"
             f"{history_header}\n"
             f"{short_term_memory}\n"
             f"{history_footer}\n\n"
-            "--- BEGIN CURRENT USER PROMPT ---" # This wrapper is key to the security
+            "--- BEGIN CURRENT USER PROMPT ---"
         )
         
-        # The base context is returned. The calling function will add the actual user message.
         return [context_string]
 
     # --- Helper and Response Processing Methods ---
@@ -221,13 +216,12 @@ class GeminiCog(commands.Cog):
         chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
         for i, chunk in enumerate(chunks):
             attached_files = files if i == 0 else None
-            # Use followup.send for interactions, as defer() was used
             if isinstance(ctx, discord.Interaction):
                 if i == 0:
                      await ctx.followup.send(content=chunk, files=attached_files)
                 else:
-                     await ctx.channel.send(content=chunk) # Subsequent messages can't be followups
-            else: # It's a regular message context
+                     await ctx.channel.send(content=chunk)
+            else: 
                 if i == 0:
                     await ctx.reply(chunk, files=attached_files)
                 else:
@@ -237,154 +231,130 @@ class GeminiCog(commands.Cog):
         if not response or not response.parts: return ""
 
         files_to_send = []
-        # Check for image data in response parts
         image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
         if image_parts:
             for i, part in enumerate(image_parts):
                 files_to_send.append(discord.File(io.BytesIO(part.inline_data.data), filename=f"generated_image_{i+1}.png"))
         
         full_text = "".join([p.text for p in response.parts if p.text])
+        bot_response_text = full_text # Default to the full response
         
-        # If sending an image, clean up the text. Otherwise, check for code blocks.
-        if files_to_send:
+        if files_to_send: # This block is for generated images
             bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip() or "Here is the image you requested!"
-        else:
+        else: # This block is for text, including code
             code_block_match = re.search(r"```(?:\w+)?\n([\s\S]+?)\n```", full_text)
             if code_block_match:
                 code_content = code_block_match.group(1)
                 lang_match = re.search(r"```(\w+)", full_text)
                 extension = lang_match.group(1) if lang_match else "txt"
                 files_to_send.append(discord.File(io.BytesIO(code_content.encode('utf-8')), filename=f"code.{extension}"))
-                bot_response_text = "I've generated the code you asked for and attached it as a file."
-            else:
-                bot_response_text = full_text
+                # The response text is already the full text from the AI.
+                # This sends the explanation and the code, plus the file.
 
         await self._send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
         return bot_response_text
 
-    # --- REBUILT /gemini COMMAND ---
+    # --- Commands ---
     @commands.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
-    async def gemini(self, ctx: commands.Context, *, prompt: str = None, attachment: discord.Attachment = None):
-        # Always defer for slash commands; it's good practice.
+    async def gemini(self, ctx: commands.Context, *, prompt: str = None):
         await ctx.defer()
         
         user = ctx.author
         channel = ctx.channel
-        
-        # --- Context-Aware Logic ---
-        # A DM channel won't have a guild attribute.
         is_dm = ctx.guild is None
-        # Check if the channel is whitelisted. DMs are not in the whitelist.
         is_allowed_channel = not is_dm and channel.id in self.allowed_channel_ids
 
         final_prompt_parts = []
-        
-        # 1. Build context ONLY if in an allowed channel
         if is_allowed_channel:
-            print(f"Context-aware request in allowed channel: {channel.id}")
             final_prompt_parts.extend(self._build_context_prompt(user.id, channel.id))
-        else:
-            print(f"Pure prompt request from user {user.id} (DM: {is_dm}, Channel: {channel.id if not is_dm else 'N/A'})")
-            # For pure prompts, we don't add any history or notes.
 
-        # 2. Add the user's current message/input
-        user_content_for_log = prompt if prompt else ""
-        current_input_dict = {
-            "role": "user", "timestamp": ctx.message.created_at.isoformat(),
-            "author_id": user.id, "author_name": user.display_name, "content": prompt or ""
-        }
-        
-        # 3. Handle attachments
-        if attachment:
-            user_content_for_log += f" [Attached file: {attachment.filename}]"
-            # We only process images for now
-            if "image" in attachment.content_type:
+        user_content = prompt or ""
+        # Handle attachments
+        for attachment in ctx.message.attachments:
+            # Handle images
+            if attachment.content_type and 'image' in attachment.content_type:
                 try:
                     img_bytes = await attachment.read()
-                    img = Image.open(io.BytesIO(img_bytes))
-                    final_prompt_parts.append(img)
-                    if not prompt: current_input_dict["content"] = "[User sent an image.]"
+                    final_prompt_parts.append(Image.open(io.BytesIO(img_bytes)))
+                    if not prompt: user_content = "[User sent an image.]"
                 except Exception as e:
                     await ctx.followup.send(f"I had trouble reading that image file. Error: {e}")
                     return
-            else:
-                current_input_dict["content"] += f" (Attached file: '{attachment.filename}' that cannot be viewed)"
-
-        if not prompt and not attachment:
-            current_input_dict["content"] = "[Continuation without text]"
-            user_content_for_log = "[Continuation without text]"
-
-        # Add the final user input as a JSON string for clarity in the prompt
-        final_prompt_parts.append(json.dumps(current_input_dict))
+            # Handle text-based files
+            elif attachment.content_type and attachment.content_type.startswith('text/'):
+                try:
+                    file_bytes = await attachment.read()
+                    file_text = file_bytes.decode('utf-8')
+                    user_content += f"\n\n--- ATTACHED FILE: {attachment.filename} ---\n{file_text}\n--- END FILE ---"
+                except Exception as e:
+                    await ctx.followup.send(f"I had trouble reading the text file '{attachment.filename}'. Error: {e}")
+                    return
         
-        print(f"{user.display_name} ({user.id}) used /gemini in channel {channel.id}")
+        if not user_content and not any(isinstance(p, Image.Image) for p in final_prompt_parts):
+            user_content = "[Continuation without text]"
 
+        final_prompt_parts.append(f"\n{user.display_name} (<@{user.id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
+        
         try:
-            # 4. Generate the response
             response = await self._generate_with_full_rotation(final_prompt_parts, persona=self.persona)
             if not response or not response.parts:
                 await ctx.followup.send("My response was blocked or empty. This might be due to safety filters.")
                 return
 
-            # 5. Process and send the response message
             final_bot_text = await self._process_and_send_response(ctx, response)
             
-            # 6. Log and update notes ONLY if in an allowed channel
             if is_allowed_channel:
-                self._log_to_chat_history(channel.id, user, ctx.message.created_at, user_content_for_log.strip(), final_bot_text)
-                summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'"
+                self._log_to_chat_history(channel.id, user, ctx.message.created_at, user_content, final_bot_text)
+                summary = f"User Prompt: '{user_content}'\nBot Response: '{final_bot_text}'"
                 await self._update_notes_with_gemini(user.id, summary)
                 
         except Exception as e:
             await ctx.followup.send(f"An unexpected error occurred: `{e}`")
 
-    # --- Event Listener (on_message) ---
-    # The on_message listener is inherently context-aware because it only
-    # triggers in allowed channels, so it doesn't need changes.
+    # --- Event Listener ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Standard checks: ignore bots, ensure channel is allowed
         if message.author.bot or (message.guild and message.channel.id not in self.allowed_channel_ids):
             return
 
-        # --- CORRECTED TRIGGER LOGIC ---
-        # Define the keywords and natural phrases that should trigger the bot
         mention_triggers = ['1392960230228492508', 'gem']
         content_lower = message.content.lower()
-
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == self.bot.user
-        
-        # Check for direct @mention OR if 'gem'/'gemini' are in the message
         contains_mention = self.bot.user.mentioned_in(message) or any(word in content_lower for word in mention_triggers)
 
-        # Only trigger if one of the conditions is met
         if not (is_dm or is_reply_to_bot or contains_mention):
             return
-        # --- END OF CORRECTION ---
 
         async with message.channel.typing():
             user_id = message.author.id
             channel_id = message.channel.id
             
-            # 1. Build the secure base context
             prompt_parts = self._build_context_prompt(user_id, channel_id)
             
-            # 2. Safely prepare the user's content and handle any attachments
             user_content = message.content
+            # Handle attachments
             for attachment in message.attachments:
-                if "image" in attachment.content_type:
+                # Handle images
+                if attachment.content_type and 'image' in attachment.content_type:
                     try:
                         prompt_parts.append(Image.open(io.BytesIO(await attachment.read())))
                     except Exception as e:
                         print(f"Could not process image in on_message: {e}")
+                        user_content += f"\n[Attachment Error: Failed to read image '{attachment.filename}']"
+                # Handle text files
+                elif attachment.content_type and attachment.content_type.startswith('text/'):
+                    try:
+                        file_bytes = await attachment.read()
+                        file_text = file_bytes.decode('utf-8')
+                        user_content += f"\n\n--- ATTACHED FILE: {attachment.filename} ---\n{file_text}\n--- END FILE ---"
+                    except Exception as e:
+                        print(f"Could not process text file in on_message: {e}")
+                        user_content += f"\n[Attachment Error: Failed to read text file '{attachment.filename}']"
                 else:
                     user_content += f" (Note: User also attached a non-image file named '{attachment.filename}')"
 
-            # 3. Add the current user's message, safely wrapped
             prompt_parts.append(f"\n{message.author.display_name} (<@{user_id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
-
-            print(f"Secure prompt initiated by {message.author.display_name} ({user_id}) in channel {channel_id}")
 
             try:
                 response = await self._generate_with_full_rotation(prompt_parts, persona=self.persona)
@@ -394,7 +364,6 @@ class GeminiCog(commands.Cog):
                 
                 final_bot_text = await self._process_and_send_response(message, response)
                 
-                # Log history and update notes
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
                 summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
                 await self._update_notes_with_gemini(user_id, summary)
