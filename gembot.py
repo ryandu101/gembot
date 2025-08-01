@@ -1,4 +1,4 @@
-import discord
+'''import discord
 from discord.ext import commands
 import os
 import json
@@ -38,10 +38,11 @@ class Gembot(commands.Bot):
         # Attach config paths and script directory to the bot instance
         self.config_files = CONFIG_FILES
         self.script_dir = SCRIPT_DIR
+        self.remove_command('help')
 
     async def setup_hook(self):
         """This hook is called after the bot logs in but before it is ready."""
-        print("Running setup_hook: Loading cogs and syncing commands...")
+        print("Running setup_hook: Loading cogs...")
         
         # Load all Python files in the 'cogs' directory as extensions
         cogs_dir = os.path.join(self.script_dir, 'cogs')
@@ -53,8 +54,11 @@ class Gembot(commands.Bot):
                 except Exception as e:
                     print(f'❌ Failed to load cog {filename}.')
                     print(f'[ERROR] {e}')
-        
-        # Sync application commands globally
+
+    async def on_ready(self):
+        """Called when the bot is fully logged in and ready."""
+        print(f'Logged in as {self.user} (ID: {self.user.id})')
+        print('Bot is ready and online!')
         try:
             synced = await self.tree.sync()
             print(f"Synced {len(synced)} application commands globally.")
@@ -72,7 +76,21 @@ async def main():
     intents.members = True          # Recommended for user-related data
 
     # Create and run the bot instance
-    bot = Gembot(command_prefix="/", intents=intents)
+    bot = Gembot(command_prefix="!", intents=intents)
+
+    # Add a sync command that only the bot owner can use
+    @bot.command(name='sync', description='Sync slash commands with Discord.')
+    @commands.is_owner()
+    async def sync(ctx: commands.Context):
+        await ctx.send("Syncing commands...")
+        try:
+            synced = await bot.tree.sync()
+            await ctx.send(f"Synced {len(synced)} commands successfully.")
+            print(f"Synced {len(synced)} commands.")
+        except Exception as e:
+            await ctx.send(f"Error syncing commands: {e}")
+            print(f"Error syncing commands: {e}")
+
     async with bot:
         await bot.start(discord_token)
 
@@ -80,4 +98,5 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("\nBot shut down by user.")
+        print("
+Bot shut down by user.")''

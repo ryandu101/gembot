@@ -305,22 +305,20 @@ class GeminiCog(commands.Cog):
         ]
 
     # --- Helper and Response Processing Methods ---
-    async def _send_long_message(self, ctx, text, files=None):
+    async def _send_long_message(self, ctx, text, files=None, ephemeral=False):
         chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
         for i, chunk in enumerate(chunks):
             attached_files = files if i == 0 else None
-            if isinstance(ctx, discord.Interaction):
-                if i == 0:
-                     await ctx.followup.send(content=chunk, files=attached_files)
-                else:
-                     await ctx.channel.send(content=chunk)
-            else: # It's a message context
-                if i == 0:
-                    await ctx.reply(chunk, files=attached_files)
-                else:
-                    await ctx.channel.send(chunk)
+            
+            # The `ephemeral` flag is only respected for interactions.
+            if i == 0:
+                # It's safe to pass `ephemeral` here. It will be ignored if not applicable.
+                await ctx.followup.send(content=chunk, files=attached_files, ephemeral=ephemeral)
+            else:
+                # Subsequent chunks of a long message cannot be ephemeral.
+                await ctx.channel.send(chunk)
 
-    async def _process_and_send_response(self, ctx, response):
+    async def _process_and_send_response(self, ctx, response, ephemeral=False):
         if not response or not response.parts: return ""
 
         files_to_send = []
@@ -344,80 +342,87 @@ class GeminiCog(commands.Cog):
             else:
                 bot_response_text = full_text
 
-        await self._send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
+        await self._send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None, ephemeral=ephemeral)
         return bot_response_text
 
-    # --- Main Command ---
+    # --- Commands ---
     @commands.hybrid_command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
-    async def gemini(self, ctx: commands.Context, *, prompt: str = None, attachment: discord.Attachment = None):
-        await ctx.defer()
+    @discord.app_commands.describe(
+        prompt="The question you want to ask the AI.",
+        ephemeral="Send a private message that only you can see."
+    )
+    async def gemini(self, ctx: commands.Context, *, prompt: str = None, ephemeral: bool = False):
+        await ctx.defer(ephemeral=ephemeral)
+
+        user = ctx.author
+        channel = ctx.channel
+        is_dm = ctx.guild is None
+        is_allowed_channel = not is_dm and channel.id in self.allowed_channel_ids
+
+        # If the user explicitly asks for an ephemeral message, respect that.
+        # Otherwise, make it ephemeral only if it's NOT an allowed channel.
+        is_ephemeral = ephemeral or not is_allowed_channel
+
+        # History is only loaded for allowed, non-ephemeral channels
+        final_prompt_parts = []
+        if is_allowed_channel:
+            final_prompt_parts.extend(self._build_context_prompt(user.id, channel.id))
+
+        user_content = prompt or ""
         
-        user_id = ctx.author.id
-        channel_id = ctx.channel.id
-        
-        final_prompt_parts = self._build_context_prompt(user_id, channel_id)
-        user_content_for_log = prompt if prompt else ""
-        
-        current_input_dict = {
-            "role": "user", "timestamp": ctx.message.created_at.isoformat(),
-            "author_id": user_id, "author_name": ctx.author.display_name, "content": prompt or ""
-        }
-        
-        if attachment:
-            user_content_for_log += f" [Attached file: {attachment.filename}]"
-            if "image" in attachment.content_type:
+        # Attachment handling needs to work for both Interactions and Messages
+        attachments = []
+        if ctx.interaction:
+            # For slash commands, attachments are not in the message object yet
+            # This part requires that you handle attachments passed differently,
+            # perhaps as a separate command argument if using slash commands with attachments.
+            # Assuming for now attachments are handled in the message for hybrid commands.
+            if hasattr(ctx, 'message') and ctx.message:
+                attachments = ctx.message.attachments
+        else:
+            attachments = ctx.message.attachments
+
+        for attachment in attachments:
+            if attachment.content_type and 'image' in attachment.content_type:
                 try:
                     img = Image.open(io.BytesIO(await attachment.read()))
                     final_prompt_parts.append(img)
                     if not prompt: current_input_dict["content"] = "[User sent an image.]"
                 except Exception as e:
-                    await ctx.send(f"I had trouble reading that image file. Error: {e}")
+                    await ctx.followup.send(f"I had trouble reading that image file. Error: {e}", ephemeral=True)
                     return
-            else:
-                current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
-
-        if not prompt and not attachment:
-            current_input_dict["content"] = "[Continuation without text]"
-            user_content_for_log = "[Continuation without text]"
-
-        final_prompt_parts.append(json.dumps(current_input_dict))
+            elif attachment.content_type and attachment.content_type.startswith('text/'):
+                try:
+                    file_bytes = await attachment.read()
+                    file_text = file_bytes.decode('utf-8')
+                    user_content += f"\n\n--- ATTACHED FILE: {attachment.filename} ---\n{file_text}\n--- END FILE ---"
+                except Exception as e:
+                    await ctx.followup.send(f"I had trouble reading the text file '{attachment.filename}'. Error: {e}", ephemeral=True)
+                    return
         
-        print(f"{ctx.author.display_name} ({user_id}) used /gemini in channel {channel_id}")
+        if not user_content and not any(isinstance(p, Image.Image) for p in final_prompt_parts):
+            user_content = "[Continuation without text]"
 
+        final_prompt_parts.append(f"\n{user.display_name} (<@{user.id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
+        
         try:
-            # --- MODIFIED: Tool calling workflow ---
-            # 1. First call to the model with the tool definition
-            response = await self._generate_with_full_rotation(final_prompt_parts, tools=[self.lastfm_tool])
-            
-            # 2. Check if the model decided to call the function
-            tool_part, raw_tool_result = await self._handle_tool_call(response)
-
-            # 3. If a tool was called, send the result back to the model
-            if tool_part:
-                print("Tool was called. Sending result back to Gemini for a natural response.")
-                # Add the tool's result to the conversation history for context
-                final_prompt_parts.append(response.candidates[0].content) # Model's function call request
-                final_prompt_parts.append(tool_part) # Your function's result
-                
-                # Call the model again to get a conversational summary of the tool's output
-                response = await self._generate_with_full_rotation(final_prompt_parts)
-
-            # --- End of modification ---
-
+            response = await self._generate_with_full_rotation(final_prompt_parts, persona=self.persona)
             if not response or not response.parts:
-                await ctx.send("My response was blocked or empty. This might be due to safety filters.")
+                await ctx.followup.send("My response was blocked or empty. This might be due to safety filters.", ephemeral=True)
                 return
 
-            final_bot_text = await self._process_and_send_response(ctx, response)
-            self._log_to_chat_history(channel_id, ctx.author, ctx.message.created_at, user_content_for_log.strip(), final_bot_text)
+            final_bot_text = await self._process_and_send_response(ctx, response, ephemeral=is_ephemeral)
             
-            # Add tool result to the summary if it exists
-            summary_note = f"Tool Result: {raw_tool_result}" if raw_tool_result else ""
-            summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'\n{summary_note}"
-            await self._update_notes_with_gemini(user_id, summary)
+            # Logging and context updates should ONLY happen in allowed channels
+            if is_allowed_channel:
+                # Get the correct timestamp, whether it's from an interaction or a message
+                message_time = ctx.message.created_at if ctx.message else datetime.now(timezone.utc)
+                self._log_to_chat_history(channel.id, user, message_time, user_content, final_bot_text)
+                summary = f"User Prompt: '{user_content}'\nBot Response: '{final_bot_text}'"
+                await self._update_notes_with_gemini(user.id, summary)
                 
         except Exception as e:
-            await ctx.send(f"An unexpected error occurred: `{e}`")
+            await ctx.followup.send(f"An unexpected error occurred: `{e}`", ephemeral=True)
 
     # --- Event Listener ---
     @commands.Cog.listener()
