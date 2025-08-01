@@ -3,12 +3,17 @@ from discord.ext import commands
 import os
 import google.generativeai as genai
 from google.generativeai.types import generation_types
+from google.generativeai.types import content_types
+from google.generativeai import protos
 from google.api_core import exceptions as api_core_exceptions
 import io
 import json
 import re
 from PIL import Image
 from datetime import datetime, timezone
+
+# --- NEW: Import the LastFm class from your new cog ---
+from cogs.lastfm_cog import LastFm 
 
 class GeminiCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -20,10 +25,31 @@ class GeminiCog(commands.Cog):
         self.meta_persona = self._load_text_file(self.config_files["meta_persona"])
         _, self.gemini_api_keys = self._load_keys(self.config_files["keys"])
         self.allowed_channel_ids = self._load_allowed_channels(self.config_files["channels"])
+        
+        # --- NEW: Load Last.fm API key and create an instance ---
+        self.lastfm_api_key = self._load_keys(self.config_files["keys"])[2] # Assuming it's the 3rd key
+        self.last_fm = LastFm(self.lastfm_api_key)
 
+        # --- NEW: Define the Last.fm tool for Gemini ---
+        self.lastfm_tool = content_types.Tool(
+            function_declarations=[
+                content_types.FunctionDeclaration(
+                    name='get_top_artists',
+                    description='Fetches the top 5 most played artists for a given Last.fm username.',
+                    parameters=protos.Schema(
+                        type=protos.Type.OBJECT,
+                        properties={
+                            'username': protos.Schema(type=protos.Type.STRING, description='The username on Last.fm')
+                        },
+                        required=['username']
+                    )
+                )
+            ]
+        )
+        
         # --- State Management ---
         self.current_api_key_index = 0
-        self.short_term_memory_turns = 900
+        self.short_term_memory_turns = 800
 
         # --- Safety Settings ---
         self.safety_settings = {
@@ -34,18 +60,18 @@ class GeminiCog(commands.Cog):
         }
 
         # --- Initialize Gemini Model ---
-        # The model is created on-demand now to switch personas
+        self.model = self._create_model(persona=self.persona)
         print("GeminiCog loaded and initialized.")
 
-    # --- Configuration Loading Methods ---
+    # --- Modified Configuration Loading to get the lastfm key ---
     def _load_keys(self, filepath):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 keys = json.load(f)
-                return keys.get("discord_token"), keys.get("gemini_keys", [])
+                return keys.get("discord_token"), keys.get("gemini_keys", []), keys.get("lastfm_api_key")
         except Exception as e:
             print(f"Error loading keys from {filepath}: {e}")
-            return None, []
+            return None, [], None
 
     def _load_text_file(self, filepath):
         try:
@@ -67,8 +93,6 @@ class GeminiCog(commands.Cog):
         if not self.gemini_api_keys:
             print("Error: No Gemini API keys found.")
             return None
-        # Ensure we don't go out of bounds
-        self.current_api_key_index %= len(self.gemini_api_keys)
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
@@ -80,9 +104,10 @@ class GeminiCog(commands.Cog):
     def _rotate_api_key(self):
         self.current_api_key_index = (self.current_api_key_index + 1) % len(self.gemini_api_keys)
         print(f"Switching to API Key index {self.current_api_key_index}")
-        # The model will be re-created on the next call to _create_model
-
-    async def _generate_with_full_rotation(self, prompt_parts, persona):
+        self.model = self._create_model(persona=self.persona)
+    
+    # --- MODIFIED: The generate function now accepts and passes the tools ---
+    async def _generate_with_full_rotation(self, prompt_parts, tools=None):
         num_keys = len(self.gemini_api_keys)
         if num_keys == 0:
             raise ValueError("Cannot generate content: No Gemini API keys found.")
@@ -90,26 +115,53 @@ class GeminiCog(commands.Cog):
         last_exception = None
         for attempt in range(num_keys):
             try:
-                # Create the model here to ensure the correct persona and key are used
-                model = self._create_model(persona=persona)
-                if model is None: raise ValueError("Model creation failed.")
-
                 print(f"Attempting API call with key index {self.current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
-                response = await model.generate_content_async(prompt_parts)
+                # Pass the tools to the model
+                response = await self.model.generate_content_async(prompt_parts, tools=tools)
                 return response
             except api_core_exceptions.ResourceExhausted as e:
                 print(f"Key index {self.current_api_key_index} is over quota.")
                 last_exception = e
-                self._rotate_api_key() # Rotate for the next attempt
+                self._rotate_api_key()
             except Exception as e:
                 print(f"Encountered a non-retriable error: {e}")
-                raise e # Re-raise other errors immediately
+                raise e
         
         print("All available API keys are exhausted.")
         if last_exception:
             raise last_exception
+            
+    # --- NEW: Function to handle tool calls from the model ---
+    async def _handle_tool_call(self, response):
+        # This function checks if the model wants to call a tool
+        if not response.candidates or not response.candidates[0].content.parts:
+            return None, None
+            
+        part = response.candidates[0].content.parts[0]
+        if part.function_call:
+            function_call = part.function_call
+            if function_call.name == 'get_top_artists':
+                # Extract arguments the model provided
+                args = {key: value for key, value in function_call.args.items()}
+                username = args.get("username")
+                print(f"Gemini requested to call 'get_top_artists' for user: {username}")
 
-    # --- Persistence and Context Methods ---
+                # Call the actual Python function
+                tool_result = await self.last_fm.get_top_artists(username)
+
+                # Package the result in the format the model expects
+                return content_types.to_content(
+                    content_types.Part(
+                        function_response=content_types.FunctionResponse(
+                            name='get_top_artists',
+                            response={'result': tool_result}
+                        )
+                    )
+                ), tool_result # Return both the model-formatted part and the raw result for logging
+
+        return None, None # No function call was made
+
+    # --- Persistence and Context Methods (no changes needed here) ---
     def _load_user_notes(self, user_id):
         try:
             with open(self.config_files["notes"], 'r') as f:
@@ -129,7 +181,6 @@ class GeminiCog(commands.Cog):
             json.dump(all_notes, f, indent=4)
 
     def _log_to_chat_history(self, channel_id, user_author, user_timestamp, user_content, bot_response_text):
-        # This function should only be called for allowed channels
         try:
             with open(self.config_files["history"], 'r') as f:
                 all_histories = json.load(f)
@@ -156,9 +207,9 @@ class GeminiCog(commands.Cog):
             json.dump(all_histories, f, indent=4)
     
     async def _update_notes_with_gemini(self, user_id, conversation_summary):
-        # This function should only be called for allowed channels
         print(f"Updating notes for user {user_id}...")
         existing_notes = self._load_user_notes(user_id)
+        meta_model = self._create_model(persona=self.meta_persona)
         
         update_prompt = (
             f"**Existing Notes on User <@{user_id}>:**\n{existing_notes}\n\n"
@@ -167,8 +218,7 @@ class GeminiCog(commands.Cog):
         )
         
         try:
-            # Use the meta_persona for this specific task
-            response = await self._generate_with_full_rotation([update_prompt], persona=self.meta_persona)
+            response = await meta_model.generate_content_async(update_prompt)
             if response and response.text:
                 self._save_user_notes(user_id, response.text.strip())
                 print(f"Successfully updated notes for user {user_id}.")
@@ -176,58 +226,46 @@ class GeminiCog(commands.Cog):
             print(f"An error occurred during note update for user {user_id}: {e}")
 
     def _build_context_prompt(self, user_id, channel_id):
-        """Builds a secure and structured prompt context to prevent injection."""
         user_notes = self._load_user_notes(user_id)
         
-        # Define clear, non-natural separators for the history block
-        history_header = "--- BEGIN CONVERSATION HISTORY ---"
-        history_footer = "--- END CONVERSATION HISTORY ---"
-        
         try:
-            with open(self.config_files["history"], 'r', encoding='utf-8') as f:
+            with open(self.config_files["history"], 'r') as f:
                 all_histories = json.load(f)
             
             channel_history = all_histories.get(str(channel_id), [])
             recent_history = channel_history[-(self.short_term_memory_turns * 2):]
             
-            history_lines = []
-            for entry in recent_history:
-                # Use a simple "Author: Message" format for clarity
-                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
-                    author_name = entry.get('author_name', 'Unknown')
-                    content = entry.get('content', '')
-                    history_lines.append(f"{author_name}: {content}")
-            
+            history_lines = [json.dumps(entry) for entry in recent_history if isinstance(entry, dict)]
             short_term_memory = "\n".join(history_lines)
 
         except (FileNotFoundError, json.JSONDecodeError):
-            short_term_memory = "No chat history found for this channel."
+            short_term_memory = "No chat history found."
 
-        # This new structure clearly separates each piece of context for the model.
-        # The most important part is the "CURRENT USER PROMPT" block, which isolates the user's new message.
-        context_string = (
-            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n\n"
-            f"{history_header}\n"
-            f"{short_term_memory}\n"
-            f"{history_footer}\n\n"
-            "--- BEGIN CURRENT USER PROMPT ---" # This wrapper is key to the security
+        context_instructions = (
+            "Instructions for reading conversation history:\n"
+            "The following is a transcript of the recent conversation. Each message is a self-contained JSON object.\n"
+            "You MUST parse these JSON objects to understand the conversation flow. The 'content' field contains the message text.\n"
+            "Do not output your own responses in JSON format unless specifically asked to. Respond naturally based on the content.\n"
+            "--- End of Instructions ---\n"
         )
-        
-        # The base context is returned. The calling function will add the actual user message.
-        return [context_string]
+
+        return [
+            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
+            context_instructions,
+            f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
+        ]
 
     # --- Helper and Response Processing Methods ---
     async def _send_long_message(self, ctx, text, files=None):
         chunks = [text[i:i + 2000] for i in range(0, len(text), 2000)]
         for i, chunk in enumerate(chunks):
             attached_files = files if i == 0 else None
-            # Use followup.send for interactions, as defer() was used
             if isinstance(ctx, discord.Interaction):
                 if i == 0:
                      await ctx.followup.send(content=chunk, files=attached_files)
                 else:
-                     await ctx.channel.send(content=chunk) # Subsequent messages can't be followups
-            else: # It's a regular message context
+                     await ctx.channel.send(content=chunk)
+            else: # It's a message context
                 if i == 0:
                     await ctx.reply(chunk, files=attached_files)
                 else:
@@ -237,7 +275,6 @@ class GeminiCog(commands.Cog):
         if not response or not response.parts: return ""
 
         files_to_send = []
-        # Check for image data in response parts
         image_parts = [p for p in response.parts if hasattr(p, 'inline_data') and p.inline_data.data]
         if image_parts:
             for i, part in enumerate(image_parts):
@@ -245,7 +282,6 @@ class GeminiCog(commands.Cog):
         
         full_text = "".join([p.text for p in response.parts if p.text])
         
-        # If sending an image, clean up the text. Otherwise, check for code blocks.
         if files_to_send:
             bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip() or "Here is the image you requested!"
         else:
@@ -262,116 +298,107 @@ class GeminiCog(commands.Cog):
         await self._send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
         return bot_response_text
 
-    # --- REBUILT /gemini COMMAND ---
-    @commands.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
+    # --- Main Command ---
+    @commands.hybrid_command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
     async def gemini(self, ctx: commands.Context, *, prompt: str = None, attachment: discord.Attachment = None):
-        # Always defer for slash commands; it's good practice.
         await ctx.defer()
         
-        user = ctx.author
-        channel = ctx.channel
+        user_id = ctx.author.id
+        channel_id = ctx.channel.id
         
-        # --- Context-Aware Logic ---
-        # A DM channel won't have a guild attribute.
-        is_dm = ctx.guild is None
-        # Check if the channel is whitelisted. DMs are not in the whitelist.
-        is_allowed_channel = not is_dm and channel.id in self.allowed_channel_ids
-
-        final_prompt_parts = []
-        
-        # 1. Build context ONLY if in an allowed channel
-        if is_allowed_channel:
-            print(f"Context-aware request in allowed channel: {channel.id}")
-            final_prompt_parts.extend(self._build_context_prompt(user.id, channel.id))
-        else:
-            print(f"Pure prompt request from user {user.id} (DM: {is_dm}, Channel: {channel.id if not is_dm else 'N/A'})")
-            # For pure prompts, we don't add any history or notes.
-
-        # 2. Add the user's current message/input
+        final_prompt_parts = self._build_context_prompt(user_id, channel_id)
         user_content_for_log = prompt if prompt else ""
+        
         current_input_dict = {
             "role": "user", "timestamp": ctx.message.created_at.isoformat(),
-            "author_id": user.id, "author_name": user.display_name, "content": prompt or ""
+            "author_id": user_id, "author_name": ctx.author.display_name, "content": prompt or ""
         }
         
-        # 3. Handle attachments
         if attachment:
             user_content_for_log += f" [Attached file: {attachment.filename}]"
-            # We only process images for now
             if "image" in attachment.content_type:
                 try:
-                    img_bytes = await attachment.read()
-                    img = Image.open(io.BytesIO(img_bytes))
+                    img = Image.open(io.BytesIO(await attachment.read()))
                     final_prompt_parts.append(img)
                     if not prompt: current_input_dict["content"] = "[User sent an image.]"
                 except Exception as e:
-                    await ctx.followup.send(f"I had trouble reading that image file. Error: {e}")
+                    await ctx.send(f"I had trouble reading that image file. Error: {e}")
                     return
             else:
-                current_input_dict["content"] += f" (Attached file: '{attachment.filename}' that cannot be viewed)"
+                current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
 
         if not prompt and not attachment:
             current_input_dict["content"] = "[Continuation without text]"
             user_content_for_log = "[Continuation without text]"
 
-        # Add the final user input as a JSON string for clarity in the prompt
         final_prompt_parts.append(json.dumps(current_input_dict))
         
-        print(f"{user.display_name} ({user.id}) used /gemini in channel {channel.id}")
+        print(f"{ctx.author.display_name} ({user_id}) used /gemini in channel {channel_id}")
 
         try:
-            # 4. Generate the response
-            response = await self._generate_with_full_rotation(final_prompt_parts, persona=self.persona)
+            # --- MODIFIED: Tool calling workflow ---
+            # 1. First call to the model with the tool definition
+            response = await self._generate_with_full_rotation(final_prompt_parts, tools=[self.lastfm_tool])
+            
+            # 2. Check if the model decided to call the function
+            tool_part, raw_tool_result = await self._handle_tool_call(response)
+
+            # 3. If a tool was called, send the result back to the model
+            if tool_part:
+                print("Tool was called. Sending result back to Gemini for a natural response.")
+                # Add the tool's result to the conversation history for context
+                final_prompt_parts.append(response.candidates[0].content) # Model's function call request
+                final_prompt_parts.append(tool_part) # Your function's result
+                
+                # Call the model again to get a conversational summary of the tool's output
+                response = await self._generate_with_full_rotation(final_prompt_parts)
+
+            # --- End of modification ---
+
             if not response or not response.parts:
-                await ctx.followup.send("My response was blocked or empty. This might be due to safety filters.")
+                await ctx.send("My response was blocked or empty. This might be due to safety filters.")
                 return
 
-            # 5. Process and send the response message
             final_bot_text = await self._process_and_send_response(ctx, response)
+            self._log_to_chat_history(channel_id, ctx.author, ctx.message.created_at, user_content_for_log.strip(), final_bot_text)
             
-            # 6. Log and update notes ONLY if in an allowed channel
-            if is_allowed_channel:
-                self._log_to_chat_history(channel.id, user, ctx.message.created_at, user_content_for_log.strip(), final_bot_text)
-                summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'"
-                await self._update_notes_with_gemini(user.id, summary)
+            # Add tool result to the summary if it exists
+            summary_note = f"Tool Result: {raw_tool_result}" if raw_tool_result else ""
+            summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'\n{summary_note}"
+            await self._update_notes_with_gemini(user_id, summary)
                 
         except Exception as e:
-            await ctx.followup.send(f"An unexpected error occurred: `{e}`")
+            await ctx.send(f"An unexpected error occurred: `{e}`")
 
-    # --- Event Listener (on_message) ---
-    # The on_message listener is inherently context-aware because it only
-    # triggers in allowed channels, so it doesn't need changes.
+    # --- Event Listener ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        # Standard checks: ignore bots, ensure channel is allowed
-        if message.author.bot or (message.guild and message.channel.id not in self.allowed_channel_ids):
+        if message.guild and message.channel.id not in self.allowed_channel_ids or message.author == self.bot.user:
             return
 
-        # --- CORRECTED TRIGGER LOGIC ---
-        # Define the keywords and natural phrases that should trigger the bot
-        mention_triggers = ['1392960230228492508', 'gem']
+        mention_triggers = ['gemini', 'gem', str(self.bot.user.id)]
+        natural_triggers = ["how do", "what is", "can someone", "i wonder", "is it possible"]
         content_lower = message.content.lower()
 
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == self.bot.user
-        
-        # Check for direct @mention OR if 'gem'/'gemini' are in the message
-        contains_mention = self.bot.user.mentioned_in(message) or any(word in content_lower for word in mention_triggers)
+        contains_mention = any(trigger in content_lower for trigger in mention_triggers)
+        contains_natural = any(content_lower.startswith(phrase) for phrase in natural_triggers)
 
-        # Only trigger if one of the conditions is met
-        if not (is_dm or is_reply_to_bot or contains_mention):
+        if not (is_dm or is_reply_to_bot or contains_mention or contains_natural):
             return
-        # --- END OF CORRECTION ---
 
         async with message.channel.typing():
             user_id = message.author.id
             channel_id = message.channel.id
             
-            # 1. Build the secure base context
             prompt_parts = self._build_context_prompt(user_id, channel_id)
             
-            # 2. Safely prepare the user's content and handle any attachments
-            user_content = message.content
+            current_input_dict = {
+                "role": "user", "timestamp": message.created_at.isoformat(),
+                "author_id": user_id, "author_name": message.author.display_name, "content": message.content
+            }
+            
             for attachment in message.attachments:
                 if "image" in attachment.content_type:
                     try:
@@ -379,24 +406,33 @@ class GeminiCog(commands.Cog):
                     except Exception as e:
                         print(f"Could not process image in on_message: {e}")
                 else:
-                    user_content += f" (Note: User also attached a non-image file named '{attachment.filename}')"
+                    current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
 
-            # 3. Add the current user's message, safely wrapped
-            prompt_parts.append(f"\n{message.author.display_name} (<@{user_id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
+            prompt_parts.append(json.dumps(current_input_dict))
 
-            print(f"Secure prompt initiated by {message.author.display_name} ({user_id}) in channel {channel_id}")
+            print(f"{message.author.display_name} ({user_id}) triggered bot in channel {channel_id}")
 
             try:
-                response = await self._generate_with_full_rotation(prompt_parts, persona=self.persona)
+                # --- MODIFIED: Tool calling workflow for on_message ---
+                response = await self._generate_with_full_rotation(prompt_parts, tools=[self.lastfm_tool])
+                tool_part, raw_tool_result = await self._handle_tool_call(response)
+
+                if tool_part:
+                    print("Tool was called from on_message. Sending result back to Gemini.")
+                    prompt_parts.append(response.candidates[0].content)
+                    prompt_parts.append(tool_part)
+                    response = await self._generate_with_full_rotation(prompt_parts)
+                # --- End of modification ---
+
                 if not response or not response.parts:
-                    await message.reply("My response was blocked or empty. This might be due to safety filters.")
+                    await message.reply("My response was blocked or empty.")
                     return
                 
                 final_bot_text = await self._process_and_send_response(message, response)
-                
-                # Log history and update notes
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
-                summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
+                
+                summary_note = f"Tool Result: {raw_tool_result}" if raw_tool_result else ""
+                summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'\n{summary_note}"
                 await self._update_notes_with_gemini(user_id, summary)
 
             except Exception as e:
