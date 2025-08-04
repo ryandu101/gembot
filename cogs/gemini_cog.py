@@ -210,7 +210,17 @@ class GeminiCog(commands.Cog):
                 if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
                     author_name = entry.get('author_name', 'Unknown')
                     content = entry.get('content', '')
-                    history_lines.append(f"{author_name}: {content}")
+                    timestamp = entry.get('timestamp', '')
+                    # Parse the timestamp to make it more readable
+                    if timestamp:
+                        try:
+                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+                            formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                            history_lines.append(f"[{formatted_time}] {author_name}: {content}")
+                        except:
+                            history_lines.append(f"{author_name}: {content}")
+                    else:
+                        history_lines.append(f"{author_name}: {content}")
             
             short_term_memory = "\n".join(history_lines)
 
