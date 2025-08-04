@@ -72,7 +72,7 @@ class GeminiCog(commands.Cog):
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
-            'gemini-2.5-pro',
+            'gemini-2.5-flash',
             system_instruction=persona,
             safety_settings=self.safety_settings
         )
@@ -160,17 +160,33 @@ class GeminiCog(commands.Cog):
         print(f"Updating notes for user {user_id}...")
         existing_notes = self._load_user_notes(user_id)
         
+        # Create a more focused summary for note updating
+        # Extract just the key points from the conversation
+        summary_lines = conversation_summary.split('\n')
+        user_prompt_line = next((line for line in summary_lines if line.startswith("User Prompt:")), "")
+        bot_response_line = next((line for line in summary_lines if line.startswith("Bot Response:")), "")
+        
+        # Create a more concise summary
+        concise_summary = f"{user_prompt_line}\n{bot_response_line}".strip()
+        
         update_prompt = (
             f"**Existing Notes on User <@{user_id}>:**\n{existing_notes}\n\n"
-            f"**Recent Conversation Summary:**\n{conversation_summary}\n\n"
-            "Please update the notes based on this new information. Keep it concise."
+            f"**Recent Conversation Summary:**\n{concise_summary}\n\n"
+            "Please update the notes based on this new information. "
+            "Follow your persona guidelines strictly: keep notes under 2000 characters, "
+            "summarize rather than quote, focus on key facts and personality traits, "
+            "and maintain the structured format with markdown headings."
         )
         
         try:
             # Use the meta_persona for this specific task
             response = await self._generate_with_full_rotation([update_prompt], persona=self.meta_persona)
             if response and response.text:
-                self._save_user_notes(user_id, response.text.strip())
+                new_notes = response.text.strip()
+                # Ensure notes don't exceed 2000 characters
+                if len(new_notes) > 2000:
+                    new_notes = new_notes[:1997] + "..."
+                self._save_user_notes(user_id, new_notes)
                 print(f"Successfully updated notes for user {user_id}.")
         except Exception as e:
             print(f"An error occurred during note update for user {user_id}: {e}")
@@ -305,7 +321,10 @@ class GeminiCog(commands.Cog):
             
             if is_allowed_channel:
                 self._log_to_chat_history(channel.id, user, ctx.message.created_at, user_content, final_bot_text)
-                summary = f"User Prompt: '{user_content}'\nBot Response: '{final_bot_text}'"
+                # Create a more concise summary for note updating
+                user_prompt_preview = user_content[:200] + "..." if len(user_content) > 200 else user_content
+                bot_response_preview = final_bot_text[:200] + "..." if len(final_bot_text) > 200 else final_bot_text
+                summary = f"User Prompt: '{user_prompt_preview}'\nBot Response: '{bot_response_preview}'"
                 await self._update_notes_with_gemini(user.id, summary)
                 
         except Exception as e:
@@ -365,7 +384,10 @@ class GeminiCog(commands.Cog):
                 final_bot_text = await self._process_and_send_response(message, response)
                 
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
-                summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
+                # Create a more concise summary for note updating
+                user_prompt_preview = message.content[:200] + "..." if len(message.content) > 200 else message.content
+                bot_response_preview = final_bot_text[:200] + "..." if len(final_bot_text) > 200 else final_bot_text
+                summary = f"User Prompt: '{user_prompt_preview}'\nBot Response: '{bot_response_preview}'"
                 await self._update_notes_with_gemini(user_id, summary)
 
             except Exception as e:
