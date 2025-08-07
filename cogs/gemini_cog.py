@@ -40,22 +40,22 @@ class GeminiCog(commands.Cog):
         }
 
         # --- Initialize Gemini Model ---
-        self.google_search_tool = Tool(
-            function_declarations=[
-                generation_types.FunctionDeclaration(
-                    name="google_search_impl",
-                    description="Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up.",
-                    parameters=generation_types.Schema(
-                        type=generation_types.Type.OBJECT,
-                        properties={
-                            "query": generation_types.Schema(type=generation_types.Type.STRING),
-                            "num_results": generation_types.Schema(type=generation_types.Type.INTEGER),
+        self.google_search_tool = {
+            "function_declarations": [
+                {
+                    "name": "google_search_impl",
+                    "description": "Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up.",
+                    "parameters": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "query": {"type": "STRING"},
+                            "num_results": {"type": "INTEGER"},
                         },
-                        required=["query"],
-                    ),
-                )
+                        "required": ["query"],
+                    },
+                }
             ]
-        )
+        }
         print("GeminiCog loaded and initialized.")
 
     # --- Configuration Loading Methods ---
@@ -160,28 +160,28 @@ class GeminiCog(commands.Cog):
                             )
 
                             # Append the results back to the prompt for the next turn
-                            prompt_parts.append(generation_types.to_content(
-                                {"function_response": {"name": "google_search_impl", "response": search_results}}
-                            ))
+                            prompt_parts.append(
+                                {"tool_response": {"name": "google_search_impl", "response": search_results}}
+                            )
 
                         except GoogleSearchError as se:
                             print(f"Google Search Error: {se}")
                             # Inform the model the tool call failed
-                            prompt_parts.append(generation_types.to_content(
-                                {"function_response": {"name": "google_search_impl", "response": {"error": str(se)}}}
-                            ))
+                            prompt_parts.append(
+                                {"tool_response": {"name": "google_search_impl", "response": {"error": str(se)}}}
+                            )
                         except Exception as e:
                             print(f"An unexpected error occurred during tool call: {e}")
                             # Pass a generic error back to the model
-                            prompt_parts.append(generation_types.to_content(
-                                {"function_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}}
-                            ))
+                            prompt_parts.append(
+                                {"tool_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}}
+                            )
                     else:
                         print(f"Warning: Model called unknown tool '{tool_name}'")
                         # Inform the model the tool is not available
-                        prompt_parts.append(generation_types.to_content(
-                            {"function_response": {"name": tool_name, "response": {"error": "Tool not found."}}}
-                        ))
+                        prompt_parts.append(
+                            {"tool_response": {"name": tool_name, "response": {"error": "Tool not found."}}}
+                        )
 
                 # If the loop finishes, it means we hit the tool call limit
                 raise Exception("Exceeded maximum tool call limit.")
