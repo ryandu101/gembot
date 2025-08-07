@@ -102,7 +102,7 @@ class GeminiCog(commands.Cog):
         tools = [self.google_search_tool] if (self.google_cse_id and self.google_cse_api_key) else None
 
         return genai.GenerativeModel(
-            'gemini-2.5-flash',
+            'gemini-2.5-flash', # DO NOT CHANGE THIS LINE, 2.5 is the latest model, 1.5 is deprecated
             system_instruction=persona,
             safety_settings=self.safety_settings,
             tools=tools
