@@ -29,7 +29,7 @@ class GeminiCog(commands.Cog):
 
         # --- State Management ---
         self.current_api_key_index = 0
-        self.short_term_memory_turns = 2000
+        self.short_term_memory_turns = 800
 
         # --- Safety Settings ---
         self.safety_settings = {
@@ -102,7 +102,7 @@ class GeminiCog(commands.Cog):
         tools = [self.google_search_tool] if (self.google_cse_id and self.google_cse_api_key) else None
 
         return genai.GenerativeModel(
-            'gemini-1.5-flash', # Upgrading model for better tool use
+            'gemini-2.5-flash-lite',
             system_instruction=persona,
             safety_settings=self.safety_settings,
             tools=tools
