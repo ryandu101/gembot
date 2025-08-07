@@ -40,9 +40,21 @@ class GeminiCog(commands.Cog):
         }
 
         # --- Initialize Gemini Model ---
-        self.google_search_tool = Tool.from_function(
-            func=google_search_impl,
-            description="Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up."
+        self.google_search_tool = Tool(
+            function_declarations=[
+                generation_types.FunctionDeclaration(
+                    name="google_search_impl",
+                    description="Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up.",
+                    parameters=generation_types.Schema(
+                        type=generation_types.Type.OBJECT,
+                        properties={
+                            "query": generation_types.Schema(type=generation_types.Type.STRING),
+                            "num_results": generation_types.Schema(type=generation_types.Type.INTEGER),
+                        },
+                        required=["query"],
+                    ),
+                )
+            ]
         )
         print("GeminiCog loaded and initialized.")
 
