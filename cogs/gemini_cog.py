@@ -2,13 +2,14 @@ import discord
 from discord.ext import commands
 import os
 import google.generativeai as genai
-from google.generativeai.types import generation_types
+from google.generativeai.types import generation_types, Tool
 from google.api_core import exceptions as api_core_exceptions
 import io
 import json
 import re
 from PIL import Image
 from datetime import datetime, timezone
+from tools.google_search import google_search_impl, GoogleSearchError
 
 class GeminiCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -18,7 +19,12 @@ class GeminiCog(commands.Cog):
         # --- Load Configurations ---
         self.persona = self._load_text_file(self.config_files["persona"])
         self.meta_persona = self._load_text_file(self.config_files["meta_persona"])
-        _, self.gemini_api_keys = self._load_keys(self.config_files["keys"])
+        (
+            _,
+            self.gemini_api_keys,
+            self.google_cse_id,
+            self.google_cse_api_key,
+        ) = self._load_keys(self.config_files["keys"])
         self.allowed_channel_ids = self._load_allowed_channels(self.config_files["channels"])
 
         # --- State Management ---
@@ -34,7 +40,10 @@ class GeminiCog(commands.Cog):
         }
 
         # --- Initialize Gemini Model ---
-        # The model is created on-demand now to switch personas
+        self.google_search_tool = Tool.from_function(
+            func=google_search_impl,
+            description="Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up."
+        )
         print("GeminiCog loaded and initialized.")
 
     # --- Configuration Loading Methods ---
@@ -42,10 +51,15 @@ class GeminiCog(commands.Cog):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 keys = json.load(f)
-                return keys.get("discord_token"), keys.get("gemini_keys", [])
+                return (
+                    keys.get("discord_token"),
+                    keys.get("gemini_keys", []),
+                    keys.get("google_cse_id"),
+                    keys.get("google_cse_api_key"),
+                )
         except Exception as e:
             print(f"Error loading keys from {filepath}: {e}")
-            return None, []
+            return None, [], None, None
 
     def _load_text_file(self, filepath):
         try:
@@ -71,10 +85,15 @@ class GeminiCog(commands.Cog):
         self.current_api_key_index %= len(self.gemini_api_keys)
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
+
+        # Only provide the tool if the necessary keys are available
+        tools = [self.google_search_tool] if (self.google_cse_id and self.google_cse_api_key) else None
+
         return genai.GenerativeModel(
-            'gemini-2.5-flash-lite',
+            'gemini-1.5-flash', # Upgrading model for better tool use
             system_instruction=persona,
-            safety_settings=self.safety_settings
+            safety_settings=self.safety_settings,
+            tools=tools
         )
 
     def _rotate_api_key(self):
@@ -86,25 +105,83 @@ class GeminiCog(commands.Cog):
         num_keys = len(self.gemini_api_keys)
         if num_keys == 0:
             raise ValueError("Cannot generate content: No Gemini API keys found.")
-        
+
         last_exception = None
         for attempt in range(num_keys):
-            try:
-                # Create the model here to ensure the correct persona and key are used
-                model = self._create_model(persona=persona)
-                if model is None: raise ValueError("Model creation failed.")
+            model = self._create_model(persona=persona)
+            if model is None:
+                raise ValueError("Model creation failed.")
 
-                print(f"Attempting API call with key index {self.current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
-                response = await model.generate_content_async(prompt_parts)
-                return response
+            print(f"Attempting API call with key index {self.current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
+
+            try:
+                # Start the generation loop
+                for i in range(5): # Limit to 5 tool calls to prevent infinite loops
+                    response = await model.generate_content_async(prompt_parts)
+
+                    # Check for tool calls
+                    if not response.candidates or not response.candidates[0].content.parts:
+                        return response # No content, return as is
+
+                    part = response.candidates[0].content.parts[0]
+                    if not hasattr(part, 'function_call'):
+                        return response # It's a final answer
+
+                    # --- Handle Tool Call ---
+                    function_call = part.function_call
+                    tool_name = function_call.name
+
+                    print(f"Model requested to use tool: {tool_name}")
+
+                    if tool_name == "google_search_impl":
+                        try:
+                            # Extract args and call the tool function
+                            args = {key: value for key, value in function_call.args.items()}
+                            print(f"Tool args: {args}")
+
+                            # Call the actual search function with required auth
+                            search_results = await google_search_impl(
+                                api_key=self.google_cse_api_key,
+                                cse_id=self.google_cse_id,
+                                query=args.get("query", ""),
+                                num_results=args.get("num_results", 5)
+                            )
+
+                            # Append the results back to the prompt for the next turn
+                            prompt_parts.append(generation_types.to_content(
+                                {"function_response": {"name": "google_search_impl", "response": search_results}}
+                            ))
+
+                        except GoogleSearchError as se:
+                            print(f"Google Search Error: {se}")
+                            # Inform the model the tool call failed
+                            prompt_parts.append(generation_types.to_content(
+                                {"function_response": {"name": "google_search_impl", "response": {"error": str(se)}}}
+                            ))
+                        except Exception as e:
+                            print(f"An unexpected error occurred during tool call: {e}")
+                            # Pass a generic error back to the model
+                            prompt_parts.append(generation_types.to_content(
+                                {"function_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}}
+                            ))
+                    else:
+                        print(f"Warning: Model called unknown tool '{tool_name}'")
+                        # Inform the model the tool is not available
+                        prompt_parts.append(generation_types.to_content(
+                            {"function_response": {"name": tool_name, "response": {"error": "Tool not found."}}}
+                        ))
+
+                # If the loop finishes, it means we hit the tool call limit
+                raise Exception("Exceeded maximum tool call limit.")
+
             except api_core_exceptions.ResourceExhausted as e:
                 print(f"Key index {self.current_api_key_index} is over quota.")
                 last_exception = e
-                self._rotate_api_key() # Rotate for the next attempt
+                self._rotate_api_key()  # Rotate for the next attempt and continue the outer loop
             except Exception as e:
                 print(f"Encountered a non-retriable error: {e}")
-                raise e # Re-raise other errors immediately
-        
+                raise e  # Re-raise other critical errors immediately
+
         print("All available API keys are exhausted.")
         if last_exception:
             raise last_exception

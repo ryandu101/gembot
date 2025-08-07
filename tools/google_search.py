@@ -5,17 +5,17 @@ from typing import Any, Dict, List
 class GoogleSearchError(Exception):
     pass
 
-async def google_search_impl(query: str, num_results: int = 5) -> Dict[str, Any]:
+async def google_search_impl(
+    api_key: str,
+    cse_id: str,
+    query: str,
+    num_results: int = 5
+) -> Dict[str, Any]:
     """
     Perform a Google Custom Search (JSON API) and return structured results.
-    Requires env vars:
-      - GOOGLE_CSE_API_KEY
-      - GOOGLE_CSE_ID
     """
-    api_key = os.environ.get("GOOGLE_CSE_API_KEY")
-    cse_id = os.environ.get("GOOGLE_CSE_ID")
     if not api_key or not cse_id:
-        raise GoogleSearchError("Missing GOOGLE_CSE_API_KEY or GOOGLE_CSE_ID environment variables.")
+        raise GoogleSearchError("Missing GOOGLE_CSE_API_KEY or GOOGLE_CSE_ID.")
 
     num_results = max(1, min(10, int(num_results)))
     url = "https://www.googleapis.com/customsearch/v1"
