@@ -29,7 +29,7 @@ class GeminiCog(commands.Cog):
 
         # --- State Management ---
         self.current_api_key_index = 0
-        self.short_term_memory_turns = 2000
+        self.short_term_memory_turns = 800
 
         # --- Safety Settings ---
         self.safety_settings = {
