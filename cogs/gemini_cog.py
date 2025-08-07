@@ -23,7 +23,7 @@ class GeminiCog(commands.Cog):
 
         # --- State Management ---
         self.current_api_key_index = 0
-        self.short_term_memory_turns = 2000
+        self.short_term_memory_turns = 900
 
         # --- Safety Settings ---
         self.safety_settings = {
@@ -72,7 +72,7 @@ class GeminiCog(commands.Cog):
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
-            'gemini-2.5-flash-lite',
+            'gemini-2.5-pro',
             system_instruction=persona,
             safety_settings=self.safety_settings
         )
