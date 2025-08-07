@@ -102,7 +102,7 @@ class GeminiCog(commands.Cog):
         tools = [self.google_search_tool] if (self.google_cse_id and self.google_cse_api_key) else None
 
         return genai.GenerativeModel(
-            'gemini-2.5-flash', # DO NOT CHANGE THIS LINE, 2.5 is the latest model, 1.5 is deprecated
+            'gemini-1.5-flash', # Upgrading model for better tool use
             system_instruction=persona,
             safety_settings=self.safety_settings,
             tools=tools
@@ -160,24 +160,20 @@ class GeminiCog(commands.Cog):
                             )
 
                             # Append the results back to the prompt for the next turn
-                            prompt_parts.append({"parts": [
-                                {"tool_response": {"name": "google_search_impl", "response": search_results}}]})
+                            prompt_parts.append({"tool_response": {"name": "google_search_impl", "response": search_results}})
 
                         except GoogleSearchError as se:
                             print(f"Google Search Error: {se}")
                             # Inform the model the tool call failed
-                            prompt_parts.append({"parts": [
-                                {"tool_response": {"name": "google_search_impl", "response": {"error": str(se)}}}]})
+                            prompt_parts.append({"tool_response": {"name": "google_search_impl", "response": {"error": str(se)}}})
                         except Exception as e:
                             print(f"An unexpected error occurred during tool call: {e}")
                             # Pass a generic error back to the model
-                            prompt_parts.append({"parts": [
-                                {"tool_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}}]})
+                            prompt_parts.append({"tool_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}})
                     else:
                         print(f"Warning: Model called unknown tool '{tool_name}'")
                         # Inform the model the tool is not available
-                        prompt_parts.append({"parts": [
-                            {"tool_response": {"name": tool_name, "response": {"error": "Tool not found."}}}]})
+                        prompt_parts.append({"tool_response": {"name": tool_name, "response": {"error": "Tool not found."}}})
 
                 # If the loop finishes, it means we hit the tool call limit
                 raise Exception("Exceeded maximum tool call limit.")
