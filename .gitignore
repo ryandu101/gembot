@@ -22,6 +22,7 @@ __pycache__/
 # --- IDE / Editor specific files ---
 # Visual Studio Code
 .vscode/
+/gemini_cli/
 
 # Jetbrains
 .idea/
