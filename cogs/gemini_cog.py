@@ -9,6 +9,7 @@ import json
 import re
 from PIL import Image
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
 class GeminiCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -108,6 +109,147 @@ class GeminiCog(commands.Cog):
         print("All available API keys are exhausted.")
         if last_exception:
             raise last_exception
+
+    # --- Web Search (via Gemini googleSearch tool) ---
+    async def _web_search_via_gemini(self, query: str) -> Tuple[str, List[Dict[str, Optional[str]]]]:
+        """Perform a web search using Gemini's built-in googleSearch tool.
+
+        Returns (formatted_text_with_citations, sources_list)
+        sources_list: [{ 'title': str|None, 'uri': str|None }]
+        """
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty.")
+
+        num_keys = len(self.gemini_api_keys)
+        if num_keys == 0:
+            raise ValueError("Cannot perform web search: No Gemini API keys found.")
+
+        last_exception: Optional[Exception] = None
+        for _ in range(num_keys):
+            try:
+                model = self._create_model(persona=self.persona)
+                if model is None:
+                    raise ValueError("Model creation failed.")
+
+                # Use a simple text content and enable the googleSearch tool.
+                response = await model.generate_content_async(
+                    query,
+                    tools=[{"googleSearch": {}}],
+                )
+
+                base_text = getattr(response, "text", None) or ""
+                if not base_text:
+                    try:
+                        base_text = "".join([
+                            p.text for p in getattr(response, "parts", []) if getattr(p, "text", None)
+                        ])
+                    except Exception:
+                        base_text = ""
+
+                formatted_text, sources = self._inject_citations_and_sources(base_text, response)
+                return formatted_text, sources
+
+            except api_core_exceptions.ResourceExhausted as e:
+                last_exception = e
+                self._rotate_api_key()
+                continue
+            except TypeError as e:
+                # Likely SDK doesn't support tools in this version
+                raise RuntimeError("Gemini googleSearch tool not supported by current SDK/version.") from e
+            except Exception as e:
+                raise e
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("All available API keys are exhausted for web search.")
+
+    def _inject_citations_and_sources(
+        self,
+        response_text: str,
+        response: Any,
+    ) -> Tuple[str, List[Dict[str, Optional[str]]]]:
+        """Insert [n] citation markers and add a Sources list based on grounding metadata."""
+        text = response_text or ""
+
+        # Access candidate grounding metadata safely
+        candidate0: Optional[Any] = None
+        try:
+            candidates = getattr(response, "candidates", None)
+            if candidates and len(candidates) > 0:
+                candidate0 = candidates[0]
+        except Exception:
+            candidate0 = None
+
+        grounding_meta = None
+        if candidate0 is not None:
+            grounding_meta = (
+                getattr(candidate0, "groundingMetadata", None)
+                or getattr(candidate0, "grounding_metadata", None)
+            )
+
+        if grounding_meta is None:
+            return text, []
+
+        def _get(obj: Any, camel: str, snake: str, default=None):
+            if obj is None:
+                return default
+            val = getattr(obj, camel, None)
+            if val is None:
+                val = getattr(obj, snake, None)
+            if val is None and isinstance(obj, dict):
+                val = obj.get(camel) or obj.get(snake)
+            return val if val is not None else default
+
+        grounding_chunks = _get(grounding_meta, "groundingChunks", "grounding_chunks", []) or []
+        grounding_supports = _get(grounding_meta, "groundingSupports", "grounding_supports", []) or []
+
+        # Gather insertions of citation markers
+        insertions: List[Tuple[int, str]] = []
+        for support in grounding_supports:
+            segment = _get(support, "segment", "segment", None)
+            if not segment:
+                continue
+            end_index = _get(segment, "endIndex", "end_index", None)
+            idxs = _get(support, "groundingChunkIndices", "grounding_chunk_indices", None)
+            if end_index is None or not idxs:
+                continue
+            try:
+                marks = "".join([f"[{int(i)+1}]" for i in idxs])
+            except Exception:
+                marks = ""
+            if marks:
+                try:
+                    end_idx_int = int(end_index)
+                except Exception:
+                    continue
+                insertions.append((max(0, min(len(text), end_idx_int)), marks))
+
+        # Insert in descending order to avoid shifting indices
+        insertions.sort(key=lambda x: x[0], reverse=True)
+        if insertions:
+            chars = list(text)
+            for idx, marker in insertions:
+                if 0 <= idx <= len(chars):
+                    chars[idx:idx] = list(marker)
+            text = "".join(chars)
+
+        # Build sources list
+        sources: List[Dict[str, Optional[str]]] = []
+        for chunk in grounding_chunks:
+            web = _get(chunk, "web", "web", None)
+            title = _get(web, "title", "title", None)
+            uri = _get(web, "uri", "uri", None)
+            sources.append({"title": title, "uri": uri})
+
+        if sources:
+            lines = []
+            for idx, s in enumerate(sources, start=1):
+                title = s.get("title") or "Untitled"
+                uri = s.get("uri") or "No URI"
+                lines.append(f"[{idx}] {title} ({uri})")
+            text = text + ("\n\nSources:\n" + "\n".join(lines))
+
+        return text, sources
 
     # --- Persistence and Context Methods ---
     def _load_user_notes(self, user_id):
@@ -339,6 +481,32 @@ class GeminiCog(commands.Cog):
                 
         except Exception as e:
             await ctx.followup.send(f"An unexpected error occurred: `{e}`")
+
+    @commands.command(name="search", description="Search the web via Google (Gemini tool) and return results with sources.")
+    async def search(self, ctx: commands.Context, *, query: str):
+        await ctx.defer()
+
+        user = ctx.author
+        channel = ctx.channel
+        is_dm = ctx.guild is None
+        is_allowed_channel = not is_dm and channel.id in self.allowed_channel_ids
+
+        try:
+            result_text, _sources = await self._web_search_via_gemini(query)
+        except RuntimeError:
+            await ctx.followup.send("Web search tool not available. Update the Gemini SDK or enable a fallback.")
+            return
+        except Exception as e:
+            await ctx.followup.send(f"Search error: `{e}`")
+            return
+
+        await self._send_long_message(ctx, f"Web search results for \"{query}\":\n\n{result_text}")
+
+        if is_allowed_channel:
+            try:
+                self._log_to_chat_history(channel.id, user, ctx.message.created_at, f"[WEB_SEARCH] {query}", result_text)
+            except Exception:
+                pass
 
     # --- Event Listener ---
     @commands.Cog.listener()
