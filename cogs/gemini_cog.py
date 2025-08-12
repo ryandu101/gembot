@@ -2,14 +2,14 @@ import discord
 from discord.ext import commands
 import os
 import google.generativeai as genai
-from google.generativeai.types import generation_types, Tool
+from google.generativeai.types import generation_types
 from google.api_core import exceptions as api_core_exceptions
 import io
 import json
 import re
 from PIL import Image
 from datetime import datetime, timezone
-from tools.google_search import google_search_impl, GoogleSearchError
+from typing import Any, Dict, List, Optional, Tuple
 
 class GeminiCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -19,12 +19,7 @@ class GeminiCog(commands.Cog):
         # --- Load Configurations ---
         self.persona = self._load_text_file(self.config_files["persona"])
         self.meta_persona = self._load_text_file(self.config_files["meta_persona"])
-        (
-            _,
-            self.gemini_api_keys,
-            self.google_cse_id,
-            self.google_cse_api_key,
-        ) = self._load_keys(self.config_files["keys"])
+        _, self.gemini_api_keys = self._load_keys(self.config_files["keys"])
         self.allowed_channel_ids = self._load_allowed_channels(self.config_files["channels"])
 
         # --- State Management ---
@@ -40,22 +35,7 @@ class GeminiCog(commands.Cog):
         }
 
         # --- Initialize Gemini Model ---
-        self.google_search_tool = {
-            "function_declarations": [
-                {
-                    "name": "google_search_impl",
-                    "description": "Performs a Google search and returns a list of results. Use this for recent information or when you need to look something up.",
-                    "parameters": {
-                        "type": "OBJECT",
-                        "properties": {
-                            "query": {"type": "STRING"},
-                            "num_results": {"type": "INTEGER"},
-                        },
-                        "required": ["query"],
-                    },
-                }
-            ]
-        }
+        self.model = self._create_model(persona=self.persona)
         print("GeminiCog loaded and initialized.")
 
     # --- Configuration Loading Methods ---
@@ -63,15 +43,10 @@ class GeminiCog(commands.Cog):
         try:
             with open(filepath, 'r', encoding='utf-8') as f:
                 keys = json.load(f)
-                return (
-                    keys.get("discord_token"),
-                    keys.get("gemini_keys", []),
-                    keys.get("google_cse_id"),
-                    keys.get("google_cse_api_key"),
-                )
+                return keys.get("discord_token"), keys.get("gemini_keys", [])
         except Exception as e:
             print(f"Error loading keys from {filepath}: {e}")
-            return None, [], None, None
+            return None, []
 
     def _load_text_file(self, filepath):
         try:
@@ -93,102 +68,194 @@ class GeminiCog(commands.Cog):
         if not self.gemini_api_keys:
             print("Error: No Gemini API keys found.")
             return None
-        # Ensure we don't go out of bounds
-        self.current_api_key_index %= len(self.gemini_api_keys)
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
-
-        # Only provide the tool if the necessary keys are available
-        tools = [self.google_search_tool] if (self.google_cse_id and self.google_cse_api_key) else None
-
         return genai.GenerativeModel(
-            'gemini-2.5-flash', Upgrading model for better tool use
+            'gemini-2.5-pro',
             system_instruction=persona,
-            safety_settings=self.safety_settings,
-            tools=tools
+            safety_settings=self.safety_settings
         )
 
     def _rotate_api_key(self):
         self.current_api_key_index = (self.current_api_key_index + 1) % len(self.gemini_api_keys)
         print(f"Switching to API Key index {self.current_api_key_index}")
-        # The model will be re-created on the next call to _create_model
+        self.model = self._create_model(persona=self.persona)
 
-    async def _generate_with_full_rotation(self, prompt_parts, persona):
+    async def _generate_with_full_rotation(self, prompt_parts):
         num_keys = len(self.gemini_api_keys)
         if num_keys == 0:
             raise ValueError("Cannot generate content: No Gemini API keys found.")
-
+        
         last_exception = None
         for attempt in range(num_keys):
-            model = self._create_model(persona=persona)
-            if model is None:
-                raise ValueError("Model creation failed.")
-
-            print(f"Attempting API call with key index {self.current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
-
             try:
-                # Start the generation loop
-                for i in range(5): # Limit to 5 tool calls to prevent infinite loops
-                    response = await model.generate_content_async(prompt_parts)
-
-                    # Check for tool calls
-                    if not response.candidates or not response.candidates[0].content.parts:
-                        return response # No content, return as is
-
-                    part = response.candidates[0].content.parts[0]
-                    if not hasattr(part, 'function_call'):
-                        return response # It's a final answer
-
-                    # --- Handle Tool Call ---
-                    function_call = part.function_call
-                    tool_name = function_call.name
-
-                    print(f"Model requested to use tool: {tool_name}")
-
-                    if tool_name == "google_search_impl":
-                        try:
-                            # Extract args and call the tool function
-                            args = {key: value for key, value in function_call.args.items()}
-                            print(f"Tool args: {args}")
-
-                            # Call the actual search function with required auth
-                            search_results = await google_search_impl(
-                                api_key=self.google_cse_api_key,
-                                cse_id=self.google_cse_id,
-                                query=args.get("query", ""),
-                                num_results=args.get("num_results", 5)
-                            )
-
-                            # Append the results back to the prompt for the next turn
-                            prompt_parts.append({"function_response": {"name": "google_search_impl", "response": search_results}})
-
-                        except GoogleSearchError as se:
-                            print(f"Google Search Error: {se}")
-                            # Inform the model the tool call failed
-                            prompt_parts.append({"function_response": {"name": "google_search_impl", "response": {"error": str(se)}}})
-                        except Exception as e:
-                            print(f"An unexpected error occurred during tool call: {e}")
-                            # Pass a generic error back to the model
-                            prompt_parts.append({"function_response": {"name": "google_search_impl", "response": {"error": f"Tool execution failed: {e}"}}})
-                    else:
-                        print(f"Warning: Model called unknown tool '{tool_name}'")
-                        # Inform the model the tool is not available
-                        prompt_parts.append({"function_response": {"name": tool_name, "response": {"error": "Tool not found."}}})
-
-                # If the loop finishes, it means we hit the tool call limit
-                raise Exception("Exceeded maximum tool call limit.")
-
+                print(f"Attempting API call with key index {self.current_api_key_index} (Attempt {attempt + 1}/{num_keys})")
+                response = await self.model.generate_content_async(prompt_parts)
+                return response
             except api_core_exceptions.ResourceExhausted as e:
                 print(f"Key index {self.current_api_key_index} is over quota.")
                 last_exception = e
-                self._rotate_api_key()  # Rotate for the next attempt and continue the outer loop
+                self._rotate_api_key()
             except Exception as e:
                 print(f"Encountered a non-retriable error: {e}")
-                raise e  # Re-raise other critical errors immediately
-
+                raise e
+        
         print("All available API keys are exhausted.")
         if last_exception:
             raise last_exception
+
+    # --- Web Search (via Gemini googleSearch tool) ---
+    async def _web_search_via_gemini(self, query: str) -> Tuple[str, List[Dict[str, Optional[str]]]]:
+        """Perform a web search using Gemini's built-in googleSearch tool.
+
+        Returns a tuple of (formatted_text_with_citations, sources_list)
+        sources_list: [{ 'title': str|None, 'uri': str|None }]
+        """
+        if not query or not query.strip():
+            raise ValueError("Query cannot be empty.")
+
+        num_keys = len(self.gemini_api_keys)
+        if num_keys == 0:
+            raise ValueError("Cannot perform web search: No Gemini API keys found.")
+
+        last_exception: Optional[Exception] = None
+        for attempt in range(num_keys):
+            try:
+                # Create a fresh model each attempt to ensure correct key/persona
+                model = self._create_model(persona=self.persona)
+
+                # Attempt to call with the googleSearch tool enabled. The Python SDK supports
+                # passing tools to generate_content_async. Tool name may be 'googleSearch'.
+                response = await model.generate_content_async(
+                    [{"role": "user", "parts": [{"text": query}]}],
+                    tools=[{"googleSearch": {}}],
+                )
+
+                # Build formatted text with citations and sources
+                base_text = getattr(response, "text", None)
+                if not base_text:
+                    try:
+                        base_text = "".join([
+                            p.text for p in getattr(response, "parts", []) if getattr(p, "text", None)
+                        ])
+                    except Exception:
+                        base_text = ""
+
+                formatted_text, sources = self._inject_citations_and_sources(base_text or "", response)
+                return formatted_text, sources
+
+            except api_core_exceptions.ResourceExhausted as e:
+                # Rotate to next key and retry
+                last_exception = e
+                self._rotate_api_key()
+                continue
+            except TypeError as e:
+                # SDK may not support tools in this environment/version
+                raise RuntimeError(
+                    "Gemini googleSearch tool not supported by current SDK/version."
+                ) from e
+            except Exception as e:
+                # Non-retriable or unexpected; propagate
+                raise e
+
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("All available API keys are exhausted for web search.")
+
+    def _inject_citations_and_sources(
+        self,
+        response_text: str,
+        response: Any,
+    ) -> Tuple[str, List[Dict[str, Optional[str]]]]:
+        """Insert citation markers based on grounding metadata and append a Sources list.
+
+        Attempts to be robust to field naming differences (camelCase vs snake_case).
+        """
+        text = response_text or ""
+
+        # Try to access candidate grounding metadata safely
+        candidate0: Optional[Any] = None
+        try:
+            candidates = getattr(response, "candidates", None)
+            if candidates and len(candidates) > 0:
+                candidate0 = candidates[0]
+        except Exception:
+            candidate0 = None
+
+        grounding_meta = None
+        if candidate0 is not None:
+            grounding_meta = (
+                getattr(candidate0, "groundingMetadata", None)
+                or getattr(candidate0, "grounding_metadata", None)
+            )
+
+        if grounding_meta is None:
+            # No sources; just return text
+            return text, []
+
+        def _get(obj: Any, camel: str, snake: str, default=None):
+            if obj is None:
+                return default
+            val = getattr(obj, camel, None)
+            if val is None:
+                val = getattr(obj, snake, None)
+            # Dict-like fallback
+            if val is None and isinstance(obj, dict):
+                val = obj.get(camel) or obj.get(snake)
+            return val if val is not None else default
+
+        grounding_chunks = _get(grounding_meta, "groundingChunks", "grounding_chunks", []) or []
+        grounding_supports = _get(grounding_meta, "groundingSupports", "grounding_supports", []) or []
+
+        # Build insertions [n] at segment.endIndex for each support
+        insertions: List[Tuple[int, str]] = []
+        for support in grounding_supports:
+            segment = _get(support, "segment", "segment", None)
+            if not segment:
+                continue
+            end_index = _get(segment, "endIndex", "end_index", None)
+            idxs = _get(support, "groundingChunkIndices", "grounding_chunk_indices", None)
+            if end_index is None or not idxs:
+                continue
+            try:
+                marks = "".join([f"[{int(i)+1}]" for i in idxs])
+            except Exception:
+                # Best-effort fallback
+                marks = ""
+            if marks:
+                # Clamp index into range
+                try:
+                    end_idx_int = int(end_index)
+                except Exception:
+                    continue
+                insertions.append((max(0, min(len(text), end_idx_int)), marks))
+
+        # Sort descending to avoid shifting subsequent indices
+        insertions.sort(key=lambda x: x[0], reverse=True)
+        if insertions:
+            chars = list(text)
+            for idx, marker in insertions:
+                if 0 <= idx <= len(chars):
+                    chars[idx:idx] = list(marker)
+            text = "".join(chars)
+
+        # Build sources list
+        sources: List[Dict[str, Optional[str]]] = []
+        for i, chunk in enumerate(grounding_chunks):
+            web = _get(chunk, "web", "web", None)
+            title = _get(web, "title", "title", None)
+            uri = _get(web, "uri", "uri", None)
+            sources.append({"title": title, "uri": uri})
+
+        if sources:
+            lines = []
+            for idx, s in enumerate(sources, start=1):
+                title = s.get("title") or "Untitled"
+                uri = s.get("uri") or "No URI"
+                lines.append(f"[{idx}] {title} ({uri})")
+            text = text + ("\n\nSources:\n" + "\n".join(lines))
+
+        return text, sources
 
     # --- Persistence and Context Methods ---
     def _load_user_notes(self, user_id):
@@ -210,7 +277,6 @@ class GeminiCog(commands.Cog):
             json.dump(all_notes, f, indent=4)
 
     def _log_to_chat_history(self, channel_id, user_author, user_timestamp, user_content, bot_response_text):
-        # This function should only be called for allowed channels
         try:
             with open(self.config_files["history"], 'r') as f:
                 all_histories = json.load(f)
@@ -237,86 +303,53 @@ class GeminiCog(commands.Cog):
             json.dump(all_histories, f, indent=4)
     
     async def _update_notes_with_gemini(self, user_id, conversation_summary):
-        # This function should only be called for allowed channels
         print(f"Updating notes for user {user_id}...")
         existing_notes = self._load_user_notes(user_id)
-        
-        # Create a more focused summary for note updating
-        # Extract just the key points from the conversation
-        summary_lines = conversation_summary.split('\n')
-        user_prompt_line = next((line for line in summary_lines if line.startswith("User Prompt:")), "")
-        bot_response_line = next((line for line in summary_lines if line.startswith("Bot Response:")), "")
-        
-        # Create a more concise summary
-        concise_summary = f"{user_prompt_line}\n{bot_response_line}".strip()
+        meta_model = self._create_model(persona=self.meta_persona)
         
         update_prompt = (
             f"**Existing Notes on User <@{user_id}>:**\n{existing_notes}\n\n"
-            f"**Recent Conversation Summary:**\n{concise_summary}\n\n"
-            "Please update the notes based on this new information. "
-            "Follow your persona guidelines strictly: keep notes under 2000 characters, "
-            "summarize rather than quote, focus on key facts and personality traits, "
-            "and maintain the structured format with markdown headings."
+            f"**Recent Conversation Summary:**\n{conversation_summary}\n\n"
+            "Please update the notes based on this new information. Keep it concise."
         )
         
         try:
-            # Use the meta_persona for this specific task
-            response = await self._generate_with_full_rotation([update_prompt], persona=self.meta_persona)
+            response = await meta_model.generate_content_async(update_prompt)
             if response and response.text:
-                new_notes = response.text.strip()
-                # Ensure notes don't exceed 2000 characters
-                if len(new_notes) > 2000:
-                    new_notes = new_notes[:1997] + "..."
-                self._save_user_notes(user_id, new_notes)
+                self._save_user_notes(user_id, response.text.strip())
                 print(f"Successfully updated notes for user {user_id}.")
         except Exception as e:
             print(f"An error occurred during note update for user {user_id}: {e}")
 
     def _build_context_prompt(self, user_id, channel_id):
-        """Builds a secure and structured prompt context to prevent injection."""
         user_notes = self._load_user_notes(user_id)
         
-        history_header = "--- BEGIN CONVERSATION HISTORY ---"
-        history_footer = "--- END CONVERSATION HISTORY ---"
-        
         try:
-            with open(self.config_files["history"], 'r', encoding='utf-8') as f:
+            with open(self.config_files["history"], 'r') as f:
                 all_histories = json.load(f)
             
             channel_history = all_histories.get(str(channel_id), [])
             recent_history = channel_history[-(self.short_term_memory_turns * 2):]
             
-            history_lines = []
-            for entry in recent_history:
-                if isinstance(entry, dict) and 'role' in entry and 'content' in entry:
-                    author_name = entry.get('author_name', 'Unknown')
-                    content = entry.get('content', '')
-                    timestamp = entry.get('timestamp', '')
-                    # Parse the timestamp to make it more readable
-                    if timestamp:
-                        try:
-                            dt = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
-                            formatted_time = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
-                            history_lines.append(f"[{formatted_time}] {author_name}: {content}")
-                        except:
-                            history_lines.append(f"{author_name}: {content}")
-                    else:
-                        history_lines.append(f"{author_name}: {content}")
-            
+            history_lines = [json.dumps(entry) for entry in recent_history if isinstance(entry, dict)]
             short_term_memory = "\n".join(history_lines)
 
         except (FileNotFoundError, json.JSONDecodeError):
-            short_term_memory = "No chat history found for this channel."
+            short_term_memory = "No chat history found."
 
-        context_string = (
-            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n\n"
-            f"{history_header}\n"
-            f"{short_term_memory}\n"
-            f"{history_footer}\n\n"
-            "--- BEGIN CURRENT USER PROMPT ---"
+        context_instructions = (
+            "Instructions for reading conversation history:\n"
+            "The following is a transcript of the recent conversation. Each message is a self-contained JSON object.\n"
+            "You MUST parse these JSON objects to understand the conversation flow. The 'content' field contains the message text.\n"
+            "Do not output your own responses in JSON format unless specifically asked to. Respond naturally based on the content.\n"
+            "--- End of Instructions ---\n"
         )
-        
-        return [context_string]
+
+        return [
+            f"### My Long-Term Notes on <@{user_id}>:\n{user_notes}\n",
+            context_instructions,
+            f"### Recent Conversation (Short-Term Memory):\n{short_term_memory}\n"
+        ]
 
     # --- Helper and Response Processing Methods ---
     async def _send_long_message(self, ctx, text, files=None):
@@ -328,7 +361,7 @@ class GeminiCog(commands.Cog):
                      await ctx.followup.send(content=chunk, files=attached_files)
                 else:
                      await ctx.channel.send(content=chunk)
-            else: 
+            else: # It's a message context
                 if i == 0:
                     await ctx.reply(chunk, files=attached_files)
                 else:
@@ -344,96 +377,125 @@ class GeminiCog(commands.Cog):
                 files_to_send.append(discord.File(io.BytesIO(part.inline_data.data), filename=f"generated_image_{i+1}.png"))
         
         full_text = "".join([p.text for p in response.parts if p.text])
-        bot_response_text = full_text # Default to the full response
         
-        if files_to_send: # This block is for generated images
+        if files_to_send:
             bot_response_text = re.sub(r'\[Image of[^\]]+\]', '', full_text).strip() or "Here is the image you requested!"
-        else: # This block is for text, including code
+        else:
             code_block_match = re.search(r"```(?:\w+)?\n([\s\S]+?)\n```", full_text)
             if code_block_match:
                 code_content = code_block_match.group(1)
                 lang_match = re.search(r"```(\w+)", full_text)
                 extension = lang_match.group(1) if lang_match else "txt"
                 files_to_send.append(discord.File(io.BytesIO(code_content.encode('utf-8')), filename=f"code.{extension}"))
-                # The response text is already the full text from the AI.
-                # This sends the explanation and the code, plus the file.
+                bot_response_text = "I've generated the code you asked for and attached it as a file."
+            else:
+                bot_response_text = full_text
 
         await self._send_long_message(ctx, bot_response_text, files=files_to_send if files_to_send else None)
         return bot_response_text
 
-    # --- Commands ---
-    @commands.command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
-    async def gemini(self, ctx: commands.Context, *, prompt: str = None):
+    # --- Web Search Command ---
+    @commands.hybrid_command(name="search", description="Search the web via Google (Gemini tool) and return results with sources.")
+    async def search(self, ctx: commands.Context, *, query: str):
+        await ctx.defer()
+
+        # Channel gating similar to other commands
+        if ctx.guild and ctx.channel.id not in self.allowed_channel_ids:
+            await ctx.send("This command isn't enabled in this channel.")
+            return
+
+        try:
+            result_text, _sources = await self._web_search_via_gemini(query)
+        except RuntimeError as e:
+            await ctx.send(
+                "Web search tool not available in this environment. Please update the Gemini SDK or enable a fallback search.")
+            return
+        except Exception as e:
+            await ctx.send(f"Search error: `{e}`")
+            return
+
+        await self._send_long_message(ctx, f"Web search results for \"{query}\":\n\n{result_text}")
+
+        # Log to history (treat like a user->bot interaction)
+        try:
+            self._log_to_chat_history(
+                ctx.channel.id,
+                ctx.author,
+                ctx.message.created_at,
+                f"[WEB_SEARCH] {query}",
+                result_text,
+            )
+        except Exception:
+            pass
+
+    # --- Main Command ---
+    @commands.hybrid_command(name="gemini", description="Ask a question to the Gemini model, or continue the conversation.")
+    async def gemini(self, ctx: commands.Context, *, prompt: str = None, attachment: discord.Attachment = None):
+        # Use defer for potentially long operations
         await ctx.defer()
         
-        user = ctx.author
-        channel = ctx.channel
-        is_dm = ctx.guild is None
-        is_allowed_channel = not is_dm and channel.id in self.allowed_channel_ids
-
-        final_prompt_parts = []
-        if is_allowed_channel:
-            final_prompt_parts.extend(self._build_context_prompt(user.id, channel.id))
-
-        user_content = prompt or ""
-        # Handle attachments
-        for attachment in ctx.message.attachments:
-            # Handle images
-            if attachment.content_type and 'image' in attachment.content_type:
-                try:
-                    img_bytes = await attachment.read()
-                    final_prompt_parts.append(Image.open(io.BytesIO(img_bytes)))
-                    if not prompt: user_content = "[User sent an image.]"
-                except Exception as e:
-                    await ctx.followup.send(f"I had trouble reading that image file. Error: {e}")
-                    return
-            # Handle text-based files
-            elif attachment.content_type and attachment.content_type.startswith('text/'):
-                try:
-                    file_bytes = await attachment.read()
-                    file_text = file_bytes.decode('utf-8')
-                    user_content += f"\n\n--- ATTACHED FILE: {attachment.filename} ---\n{file_text}\n--- END FILE ---"
-                except Exception as e:
-                    await ctx.followup.send(f"I had trouble reading the text file '{attachment.filename}'. Error: {e}")
-                    return
+        user_id = ctx.author.id
+        channel_id = ctx.channel.id
         
-        if not user_content and not any(isinstance(p, Image.Image) for p in final_prompt_parts):
-            user_content = "[Continuation without text]"
-
-        final_prompt_parts.append(f"\n{user.display_name} (<@{user.id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
+        final_prompt_parts = self._build_context_prompt(user_id, channel_id)
+        user_content_for_log = prompt if prompt else ""
         
+        current_input_dict = {
+            "role": "user", "timestamp": ctx.message.created_at.isoformat(),
+            "author_id": user_id, "author_name": ctx.author.display_name, "content": prompt or ""
+        }
+        
+        if attachment:
+            user_content_for_log += f" [Attached file: {attachment.filename}]"
+            if "image" in attachment.content_type:
+                try:
+                    img = Image.open(io.BytesIO(await attachment.read()))
+                    final_prompt_parts.append(img)
+                    if not prompt: current_input_dict["content"] = "[User sent an image.]"
+                except Exception as e:
+                    await ctx.send(f"I had trouble reading that image file. Error: {e}")
+                    return
+            else:
+                current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
+
+        if not prompt and not attachment:
+            current_input_dict["content"] = "[Continuation without text]"
+            user_content_for_log = "[Continuation without text]"
+
+        final_prompt_parts.append(json.dumps(current_input_dict))
+        
+        print(f"{ctx.author.display_name} ({user_id}) used /gemini in channel {channel_id}")
+
         try:
-            response = await self._generate_with_full_rotation(final_prompt_parts, persona=self.persona)
+            response = await self._generate_with_full_rotation(final_prompt_parts)
             if not response or not response.parts:
-                await ctx.followup.send("My response was blocked or empty. This might be due to safety filters.")
+                await ctx.send("My response was blocked or empty. This might be due to safety filters.")
                 return
 
             final_bot_text = await self._process_and_send_response(ctx, response)
-            
-            if is_allowed_channel:
-                self._log_to_chat_history(channel.id, user, ctx.message.created_at, user_content, final_bot_text)
-                # Create a more concise summary for note updating
-                user_prompt_preview = user_content[:200] + "..." if len(user_content) > 200 else user_content
-                bot_response_preview = final_bot_text[:200] + "..." if len(final_bot_text) > 200 else final_bot_text
-                summary = f"User Prompt: '{user_prompt_preview}'\nBot Response: '{bot_response_preview}'"
-                await self._update_notes_with_gemini(user.id, summary)
+            self._log_to_chat_history(channel_id, ctx.author, ctx.message.created_at, user_content_for_log.strip(), final_bot_text)
+            summary = f"User Prompt: '{user_content_for_log.strip()}'\nBot Response: '{final_bot_text}'"
+            await self._update_notes_with_gemini(user_id, summary)
                 
         except Exception as e:
-            await ctx.followup.send(f"An unexpected error occurred: `{e}`")
+            await ctx.send(f"An unexpected error occurred: `{e}`")
 
     # --- Event Listener ---
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
-        if message.author.bot or (message.guild and message.channel.id not in self.allowed_channel_ids):
+        if message.guild and message.channel.id not in self.allowed_channel_ids or message.author == self.bot.user:
             return
 
-        mention_triggers = ['1392960230228492508', 'gem']
+        mention_triggers = ['gemini', 'gem', str(self.bot.user.id)]
+        natural_triggers = ["how do", "what is", "can someone", "i wonder", "is it possible"]
         content_lower = message.content.lower()
+
         is_dm = isinstance(message.channel, discord.DMChannel)
         is_reply_to_bot = message.reference and message.reference.resolved and message.reference.resolved.author == self.bot.user
-        contains_mention = self.bot.user.mentioned_in(message) or any(word in content_lower for word in mention_triggers)
+        contains_mention = any(trigger in content_lower for trigger in mention_triggers)
+        contains_natural = any(content_lower.startswith(phrase) for phrase in natural_triggers)
 
-        if not (is_dm or is_reply_to_bot or contains_mention):
+        if not (is_dm or is_reply_to_bot or contains_mention or contains_natural):
             return
 
         async with message.channel.typing():
@@ -442,43 +504,33 @@ class GeminiCog(commands.Cog):
             
             prompt_parts = self._build_context_prompt(user_id, channel_id)
             
-            user_content = message.content
-            # Handle attachments
+            current_input_dict = {
+                "role": "user", "timestamp": message.created_at.isoformat(),
+                "author_id": user_id, "author_name": message.author.display_name, "content": message.content
+            }
+            
             for attachment in message.attachments:
-                # Handle images
-                if attachment.content_type and 'image' in attachment.content_type:
+                if "image" in attachment.content_type:
                     try:
                         prompt_parts.append(Image.open(io.BytesIO(await attachment.read())))
                     except Exception as e:
                         print(f"Could not process image in on_message: {e}")
-                        user_content += f"\n[Attachment Error: Failed to read image '{attachment.filename}']"
-                # Handle text files
-                elif attachment.content_type and attachment.content_type.startswith('text/'):
-                    try:
-                        file_bytes = await attachment.read()
-                        file_text = file_bytes.decode('utf-8')
-                        user_content += f"\n\n--- ATTACHED FILE: {attachment.filename} ---\n{file_text}\n--- END FILE ---"
-                    except Exception as e:
-                        print(f"Could not process text file in on_message: {e}")
-                        user_content += f"\n[Attachment Error: Failed to read text file '{attachment.filename}']"
                 else:
-                    user_content += f" (Note: User also attached a non-image file named '{attachment.filename}')"
+                    current_input_dict["content"] += f" (Attached file: '{attachment.filename}')"
 
-            prompt_parts.append(f"\n{message.author.display_name} (<@{user_id}>): {user_content}\n--- END CURRENT USER PROMPT ---")
+            prompt_parts.append(json.dumps(current_input_dict))
+
+            print(f"{message.author.display_name} ({user_id}) triggered bot in channel {channel_id}")
 
             try:
-                response = await self._generate_with_full_rotation(prompt_parts, persona=self.persona)
+                response = await self._generate_with_full_rotation(prompt_parts)
                 if not response or not response.parts:
-                    await message.reply("My response was blocked or empty. This might be due to safety filters.")
+                    await message.reply("My response was blocked or empty.")
                     return
                 
                 final_bot_text = await self._process_and_send_response(message, response)
-                
                 self._log_to_chat_history(channel_id, message.author, message.created_at, message.content, final_bot_text)
-                # Create a more concise summary for note updating
-                user_prompt_preview = message.content[:200] + "..." if len(message.content) > 200 else message.content
-                bot_response_preview = final_bot_text[:200] + "..." if len(final_bot_text) > 200 else final_bot_text
-                summary = f"User Prompt: '{user_prompt_preview}'\nBot Response: '{bot_response_preview}'"
+                summary = f"User Prompt: '{message.content}'\nBot Response: '{final_bot_text}'"
                 await self._update_notes_with_gemini(user_id, summary)
 
             except Exception as e:
