@@ -72,7 +72,7 @@ class GeminiCog(commands.Cog):
         api_key = self.gemini_api_keys[self.current_api_key_index]
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(
-            'gemini-2.5-pro',
+            'gemini-2.5-flash',
             system_instruction=persona,
             safety_settings=self.safety_settings
         )
