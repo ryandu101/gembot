@@ -1,4 +1,3 @@
-```markdown
 # 💎 Gembot - Advanced Gemini Discord Bot
 
 Gembot is a powerful, context-aware Discord bot powered by Google's **Gemini 2.5 Flash** model. It features robust conversational memory, dynamic API key rotation, multi-modal attachment reading (images and text files), and automated long-term user note generation.
